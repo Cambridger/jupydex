@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.DS_Store
+.mypy_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Local credentials and connection state.
+.env
+.env.*
+!.env.example
+config.json
+credentials.json
+*.pem
+*.key
+
+# Runtime output can contain commands or remote terminal data.
+*.log
+artifacts/

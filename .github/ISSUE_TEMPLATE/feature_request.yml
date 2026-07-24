@@ -1,0 +1,37 @@
+name: Feature request
+description: Propose a focused improvement to Jupydex.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Explain the problem first. Keep examples synthetic and avoid credentials
+        or private infrastructure details.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow is difficult today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety
+      options:
+        - label: This preserves explicit terminal selection and safe destructive-action defaults.
+          required: true
+        - label: All examples use synthetic infrastructure and credentials.
+          required: true
