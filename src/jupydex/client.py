@@ -15,6 +15,7 @@ from urllib.parse import quote
 
 import httpx
 import websockets
+from websockets.exceptions import InvalidStatus, WebSocketException
 
 from .config import Settings
 from .output import clean_terminal_output
@@ -704,7 +705,7 @@ class JupyterTerminalClient:
         try:
             async with self._connector(url, **kwargs) as websocket:
                 yield websocket
-        except websockets.exceptions.InvalidStatus as exc:
+        except InvalidStatus as exc:
             response = getattr(exc, "response", None)
             status_code = getattr(response, "status_code", None)
             if status_code in {401, 403}:
@@ -712,7 +713,7 @@ class JupyterTerminalClient:
                     f"Jupyter rejected WebSocket authentication ({status_code})"
                 ) from exc
             raise GatewayError(f"Jupyter WebSocket rejected the connection: {exc}") from exc
-        except (websockets.exceptions.WebSocketException, OSError) as exc:
+        except (WebSocketException, OSError) as exc:
             raise WebSocketTransportError(
                 f"Jupyter WebSocket failed: {exc}"
             ) from exc

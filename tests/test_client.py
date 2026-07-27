@@ -9,6 +9,7 @@ from typing import Callable
 
 import httpx
 import websockets
+from websockets.exceptions import WebSocketException
 
 from jupydex.client import (
     AuthenticationError,
@@ -111,7 +112,7 @@ class _FakeConnection:
 
 class _FailingCloseConnection(_FakeConnection):
     async def __aexit__(self, *_: object) -> None:
-        raise websockets.exceptions.WebSocketException("close failed")
+        raise WebSocketException("close failed")
 
 
 class ClientTests(unittest.IsolatedAsyncioTestCase):
