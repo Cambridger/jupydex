@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import argparse
+import io
+import json
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
-from jupydex.cli import _configure
-from jupydex.config import ConfigurationError, load_config_file
+from jupydex.cli import _configure, build_parser, main
+from jupydex.client import RemoteOutcomeUnknownError
+from jupydex.config import (
+    ConfigurationError,
+    Settings,
+    load_config_file,
+)
 
 
 def _args(**overrides: object) -> argparse.Namespace:
@@ -27,6 +35,54 @@ def _args(**overrides: object) -> argparse.Namespace:
 
 
 class ConfigureTests(unittest.TestCase):
+    def test_unknown_remote_outcome_is_structured(self) -> None:
+        async def fail(*_: object, **__: object) -> object:
+            raise RemoteOutcomeUnknownError(
+                "agent_shell",
+                reconnect_attempts=3,
+                operation_id="deploy_123",
+            )
+
+        stderr = io.StringIO()
+        with (
+            mock.patch(
+                "jupydex.cli.Settings.from_env",
+                return_value=Settings(base_url="https://example.test"),
+            ),
+            mock.patch("jupydex.cli._run", new=fail),
+            redirect_stderr(stderr),
+        ):
+            exit_code = main(
+                ["exec", "--terminal", "agent_shell", "--", "true"]
+            )
+
+        payload = json.loads(stderr.getvalue())
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(payload["remote_outcome"], "unknown")
+        self.assertTrue(payload["terminal_retained"])
+        self.assertEqual(payload["reconnect_attempts"], 3)
+        self.assertEqual(payload["operation_id"], "deploy_123")
+
+    def test_operation_subcommands_parse_recovery_fields(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "operation",
+                "--terminal",
+                "agent_shell",
+                "set",
+                "--directory",
+                "/workspace/project/logs/jupydex_ops",
+                "--id",
+                "deploy_123",
+                "--state",
+                "TERM_SENT",
+            ]
+        )
+        self.assertEqual(args.action, "operation")
+        self.assertEqual(args.operation_action, "set")
+        self.assertEqual(args.operation_id, "deploy_123")
+        self.assertEqual(args.state, "TERM_SENT")
+
     def test_token_in_url_argument_is_rejected(self) -> None:
         with self.assertRaises(ConfigurationError):
             _configure(

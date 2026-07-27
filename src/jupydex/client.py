@@ -10,11 +10,12 @@ import sys
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, AsyncContextManager, AsyncIterator, Callable
+from typing import Any, AsyncContextManager, AsyncIterator, Awaitable, Callable
 from urllib.parse import quote
 
 import httpx
 import websockets
+from websockets.exceptions import InvalidStatus, WebSocketException
 
 from .config import Settings
 from .output import clean_terminal_output
@@ -32,7 +33,38 @@ class TerminalNotFoundError(GatewayError):
     """Raised when a requested terminal does not exist."""
 
 
+class WebSocketTransportError(GatewayError):
+    """Raised when a Jupyter terminal WebSocket transport fails."""
+
+
+class RemoteOutcomeUnknownError(GatewayError):
+    """Raised when transport loss prevents confirmation of remote completion."""
+
+    def __init__(
+        self,
+        terminal: str,
+        *,
+        reconnect_attempts: int,
+        operation_id: str | None = None,
+    ) -> None:
+        self.terminal = terminal
+        self.reconnect_attempts = reconnect_attempts
+        self.operation_id = operation_id
+        self.remote_outcome = "unknown"
+        self.terminal_retained = True
+        operation = (
+            f"; operation_id={operation_id}" if operation_id is not None else ""
+        )
+        super().__init__(
+            "WebSocket closed before completion marker; "
+            f"terminal={terminal}{operation}; remote outcome unknown; "
+            "terminal retained for recovery"
+        )
+
+
 _VALID_TERMINAL_NAME = re.compile(r"^[A-Za-z0-9_]+$")
+_VALID_OPERATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_VALID_OPERATION_STATE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _DETACH = object()
 
 
@@ -43,6 +75,24 @@ def validate_terminal_name(name: str) -> str:
             "underscores; Jupyter's WebSocket route rejects other characters"
         )
     return name
+
+
+def validate_operation_id(operation_id: str) -> str:
+    if not _VALID_OPERATION_ID.fullmatch(operation_id):
+        raise GatewayError(
+            "operation IDs must start with an ASCII letter or digit and contain "
+            "only ASCII letters, digits, underscores, and hyphens"
+        )
+    return operation_id
+
+
+def validate_operation_state(state: str) -> str:
+    if not _VALID_OPERATION_STATE.fullmatch(state):
+        raise GatewayError(
+            "operation states must start with an uppercase ASCII letter and "
+            "contain only uppercase ASCII letters, digits, and underscores"
+        )
+    return state
 
 
 @dataclass(slots=True)
@@ -68,6 +118,7 @@ class CommandResult:
 
 
 Connector = Callable[..., AsyncContextManager[Any]]
+Sleeper = Callable[[float], Awaitable[None]]
 
 
 class JupyterTerminalClient:
@@ -77,6 +128,8 @@ class JupyterTerminalClient:
         *,
         http_client: httpx.AsyncClient | None = None,
         connector: Connector | None = None,
+        reconnect_delays: tuple[float, ...] = (1.0, 2.0, 4.0),
+        sleeper: Sleeper = asyncio.sleep,
     ) -> None:
         self.settings = settings
         self._owns_http_client = http_client is None
@@ -89,6 +142,8 @@ class JupyterTerminalClient:
             follow_redirects=False,
         )
         self._connector = connector or websockets.connect
+        self._reconnect_delays = reconnect_delays
+        self._sleep = sleeper
 
     async def __aenter__(self) -> "JupyterTerminalClient":
         return self
@@ -298,6 +353,10 @@ class JupyterTerminalClient:
                 async def receive_output() -> int:
                     while True:
                         message = await websocket.recv()
+                        if message in (None, "", b""):
+                            raise WebSocketTransportError(
+                                "Jupyter WebSocket returned an empty frame"
+                            )
                         if isinstance(message, bytes):
                             message = message.decode("utf-8", errors="replace")
                         try:
@@ -372,14 +431,14 @@ class JupyterTerminalClient:
             raise GatewayError("command must not be empty")
         if timeout <= 0:
             raise GatewayError("timeout must be positive")
+        if max_chars <= 0:
+            raise GatewayError("max_chars must be positive")
 
         effective_cwd = cwd or self.settings.cwd
-        evaluated_command = f"eval {shlex.quote(command)}"
-        actual_command = evaluated_command
+        child_command = command
         if effective_cwd:
-            actual_command = (
-                f"if cd -- {shlex.quote(effective_cwd)}; "
-                f"then {evaluated_command}; else false; fi"
+            child_command = (
+                f"cd -- {shlex.quote(effective_cwd)} || exit $?; {command}"
             )
 
         nonce = uuid.uuid4().hex
@@ -390,8 +449,9 @@ class JupyterTerminalClient:
         )
         script = (
             f"printf '\\n{start_marker}\\n'; "
-            f"{actual_command}; "
-            "__jupydex_status=$?; "
+            "__jupydex_status=0; "
+            f"bash -lc {shlex.quote(child_command)} "
+            "|| __jupydex_status=$?; "
             f"printf '\\n{done_marker}:%s\\n' \"$__jupydex_status\"\r"
         )
         done_pattern = re.compile(
@@ -399,40 +459,81 @@ class JupyterTerminalClient:
         )
 
         started = asyncio.get_running_loop().time()
-        chunks: list[str] = []
+        captured_output = ""
         exit_code: int | None = None
         timed_out = False
+        dispatch_attempted = False
+        reconnect_attempts = 0
+        deadline = started + timeout
+        capture_limit = max(max_chars * 2, len(done_marker) + 64)
 
-        async with self._connect(name) as websocket:
-            # Let Jupyter send any reconnect scrollback before the new command.
-            await self._receive_for(websocket, chunks, duration=0.15)
-            chunks.clear()
-            await websocket.send(json.dumps(["stdin", script]))
-            deadline = started + timeout
-            while exit_code is None:
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    timed_out = True
-                    if interrupt_on_timeout:
-                        await websocket.send(json.dumps(["stdin", "\x03"]))
+        while exit_code is None and not timed_out:
+            try:
+                async with self._connect(name) as websocket:
+                    if not dispatch_attempted:
+                        # Let Jupyter send reconnect scrollback before the new
+                        # command. Reconnected sockets must retain scrollback:
+                        # it may contain the completion marker.
+                        stale_chunks: list[str] = []
+                        await self._receive_for(
+                            websocket, stale_chunks, duration=0.15
+                        )
+                        dispatch_attempted = True
+                        await websocket.send(json.dumps(["stdin", script]))
+
+                    while exit_code is None:
+                        remaining = deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            timed_out = True
+                            if interrupt_on_timeout:
+                                await websocket.send(
+                                    json.dumps(["stdin", "\x03"])
+                                )
+                            break
+                        try:
+                            message = await asyncio.wait_for(
+                                websocket.recv(), timeout=min(remaining, 1.0)
+                            )
+                        except asyncio.TimeoutError:
+                            continue
+                        text = _stdout_from_message(message)
+                        if text is None:
+                            continue
+                        captured_output = (
+                            captured_output + text
+                        )[-capture_limit:]
+                        match = done_pattern.search(captured_output)
+                        if match:
+                            exit_code = int(match.group("status"))
+            except WebSocketTransportError as exc:
+                # A close-handshake failure after a marker or an already
+                # established local timeout must not overwrite that result.
+                if exit_code is not None or timed_out:
                     break
-                try:
-                    message = await asyncio.wait_for(
-                        websocket.recv(), timeout=min(remaining, 1.0)
-                    )
-                except asyncio.TimeoutError:
-                    continue
-                text = _stdout_from_message(message)
-                if text is None:
-                    continue
-                chunks.append(text)
-                if sum(map(len, chunks)) > max_chars * 2:
-                    chunks = ["".join(chunks)[-max_chars * 2 :]]
-                match = done_pattern.search("".join(chunks))
-                if match:
-                    exit_code = int(match.group("status"))
+                if reconnect_attempts >= len(self._reconnect_delays):
+                    if dispatch_attempted:
+                        raise RemoteOutcomeUnknownError(
+                            name,
+                            reconnect_attempts=reconnect_attempts,
+                        ) from exc
+                    raise GatewayError(
+                        f"Jupyter WebSocket failed before command dispatch: {exc}"
+                    ) from exc
+                delay = self._reconnect_delays[reconnect_attempts]
+                reconnect_attempts += 1
+                if asyncio.get_running_loop().time() + delay >= deadline:
+                    if dispatch_attempted:
+                        raise RemoteOutcomeUnknownError(
+                            name,
+                            reconnect_attempts=reconnect_attempts,
+                        ) from exc
+                    raise GatewayError(
+                        "Jupyter WebSocket could not connect before the command "
+                        "deadline"
+                    ) from exc
+                await self._sleep(delay)
 
-        output = "".join(chunks)
+        output = captured_output
         start_match = start_pattern.search(output)
         if start_match:
             output = output[start_match.end() :]
@@ -451,6 +552,115 @@ class JupyterTerminalClient:
             timed_out=timed_out,
             elapsed_seconds=elapsed,
         )
+
+    async def begin_operation(
+        self,
+        name: str,
+        directory: str,
+        *,
+        operation_id: str | None = None,
+        timeout: float = 30.0,
+    ) -> dict[str, object]:
+        operation_id = validate_operation_id(operation_id or uuid.uuid4().hex)
+        return await self.set_operation_state(
+            name,
+            directory,
+            operation_id,
+            "STARTED",
+            timeout=timeout,
+        )
+
+    async def set_operation_state(
+        self,
+        name: str,
+        directory: str,
+        operation_id: str,
+        state: str,
+        *,
+        timeout: float = 30.0,
+    ) -> dict[str, object]:
+        validate_terminal_name(name)
+        operation_id = validate_operation_id(operation_id)
+        state = validate_operation_state(state)
+        status_file = _operation_status_file(directory, operation_id)
+        temporary_file = f"{status_file}.{uuid.uuid4().hex}.tmp"
+        command = (
+            f"mkdir -p -- {shlex.quote(directory)} && "
+            f"printf '%s\\n' {shlex.quote(state)} >"
+            f"{shlex.quote(temporary_file)} && "
+            f"mv -f -- {shlex.quote(temporary_file)} "
+            f"{shlex.quote(status_file)}"
+        )
+        try:
+            result = await self.execute(name, command, timeout=timeout)
+        except RemoteOutcomeUnknownError as exc:
+            raise RemoteOutcomeUnknownError(
+                name,
+                reconnect_attempts=exc.reconnect_attempts,
+                operation_id=operation_id,
+            ) from exc
+        if result.timed_out:
+            raise RemoteOutcomeUnknownError(
+                name,
+                reconnect_attempts=0,
+                operation_id=operation_id,
+            )
+        if result.exit_code != 0:
+            raise GatewayError(
+                f"failed to write operation state {state!r}; "
+                f"operation_id={operation_id}; exit_code={result.exit_code}"
+            )
+        return {
+            "terminal": name,
+            "operation_id": operation_id,
+            "state": state,
+            "status_file": status_file,
+        }
+
+    async def get_operation_state(
+        self,
+        name: str,
+        directory: str,
+        operation_id: str,
+        *,
+        timeout: float = 30.0,
+    ) -> dict[str, object]:
+        validate_terminal_name(name)
+        operation_id = validate_operation_id(operation_id)
+        status_file = _operation_status_file(directory, operation_id)
+        command = (
+            f"if test -f {shlex.quote(status_file)}; then "
+            f"cat -- {shlex.quote(status_file)}; else exit 44; fi"
+        )
+        result = await self.execute(name, command, timeout=timeout)
+        if result.timed_out:
+            raise RemoteOutcomeUnknownError(
+                name,
+                reconnect_attempts=0,
+                operation_id=operation_id,
+            )
+        if result.exit_code == 44:
+            return {
+                "terminal": name,
+                "operation_id": operation_id,
+                "exists": False,
+                "state": None,
+                "status_file": status_file,
+            }
+        if result.exit_code != 0:
+            raise GatewayError(
+                "failed to read operation state; "
+                f"operation_id={operation_id}; exit_code={result.exit_code}"
+            )
+        state = result.output.strip()
+        validate_operation_state(state)
+        return {
+            "terminal": name,
+            "operation_id": operation_id,
+            "exists": True,
+            "state": state,
+            "status_file": status_file,
+        }
 
     async def _collect(self, name: str, *, seconds: float, max_chars: int) -> str:
         chunks: list[str] = []
@@ -495,7 +705,7 @@ class JupyterTerminalClient:
         try:
             async with self._connector(url, **kwargs) as websocket:
                 yield websocket
-        except websockets.exceptions.InvalidStatus as exc:
+        except InvalidStatus as exc:
             response = getattr(exc, "response", None)
             status_code = getattr(response, "status_code", None)
             if status_code in {401, 403}:
@@ -503,8 +713,10 @@ class JupyterTerminalClient:
                     f"Jupyter rejected WebSocket authentication ({status_code})"
                 ) from exc
             raise GatewayError(f"Jupyter WebSocket rejected the connection: {exc}") from exc
-        except (websockets.exceptions.WebSocketException, OSError) as exc:
-            raise GatewayError(f"Jupyter WebSocket failed: {exc}") from exc
+        except (WebSocketException, OSError) as exc:
+            raise WebSocketTransportError(
+                f"Jupyter WebSocket failed: {exc}"
+            ) from exc
 
     async def _request(
         self,
@@ -553,13 +765,17 @@ class JupyterTerminalClient:
         return response.json()
 
 
-def _stdout_from_message(message: str | bytes) -> str | None:
+def _stdout_from_message(message: str | bytes | None) -> str | None:
+    if message in (None, "", b""):
+        raise WebSocketTransportError(
+            "Jupyter WebSocket returned an empty frame"
+        )
     if isinstance(message, bytes):
         message = message.decode("utf-8", errors="replace")
     try:
         payload = json.loads(message)
     except json.JSONDecodeError:
-        return message
+        return f"\n[JUPYDEX_NON_JSON_FRAME] {message!r}\n"
     if (
         isinstance(payload, list)
         and len(payload) >= 2
@@ -567,7 +783,25 @@ def _stdout_from_message(message: str | bytes) -> str | None:
         and isinstance(payload[1], str)
     ):
         return payload[1]
+    if (
+        isinstance(payload, list)
+        and payload
+        and payload[0] == "disconnect"
+    ):
+        raise WebSocketTransportError(
+            "Jupyter terminal disconnected before completion"
+        )
     return None
+
+
+def _operation_status_file(directory: str, operation_id: str) -> str:
+    if not directory or "\x00" in directory or "\n" in directory:
+        raise GatewayError(
+            "operation directory must be a non-empty single-line remote path"
+        )
+    base = directory.rstrip("/") or "/"
+    separator = "" if base == "/" else "/"
+    return f"{base}{separator}{operation_id}.status"
 
 
 def _terminal_size(file_descriptor: int) -> tuple[int, int]:

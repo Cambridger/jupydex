@@ -56,6 +56,8 @@ See:
   permissions exclude group and other access.
 - `doctor` redacts endpoint and path metadata by default.
 - `exec` omits the executed command from JSON by default.
+- `exec` isolates user commands in a child shell, reconnects the same terminal
+  without resending, and retains the terminal when completion is unconfirmed.
 - The local config is permission-protected, not encrypted.
 
 If a credential appears in chat, an issue, CI output, terminal transcript,

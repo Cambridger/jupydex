@@ -116,6 +116,72 @@ Typical `exec` result:
 
 Do not store the complete payload unless remote output is safe to retain.
 
+## Unknown remote outcomes
+
+Transport failure after dispatch is not a remote exit status. Jupydex retries
+the same terminal three times without resending the command. If the completion
+marker remains unconfirmed, stderr contains a structured
+`RemoteOutcomeUnknownError`:
+
+```json
+{
+  "ok": false,
+  "error": "RemoteOutcomeUnknownError",
+  "terminal": "agent_shell",
+  "remote_outcome": "unknown",
+  "terminal_retained": true,
+  "reconnect_attempts": 3
+}
+```
+
+The integration must treat this as an indeterminate transaction. It must not
+translate it to `exit_code != 0`, repeat the command, or delete the terminal.
+
+## Recoverable mutation operations
+
+For a stop, deploy, restart, migration, or similar mutation, create a durable
+operation before the first write:
+
+```bash
+operation_dir=/workspace/project/logs/jupydex_ops
+begin=$(jdx operation begin --directory "$operation_dir")
+operation_id=$(printf '%s' "$begin" | jq -r '.result.operation_id')
+```
+
+Update checkpoints only after each boundary has been verified:
+
+```bash
+jdx operation set --directory "$operation_dir" \
+  --id "$operation_id" --state PIDS_VERIFIED
+jdx operation set --directory "$operation_dir" \
+  --id "$operation_id" --state TERM_SENT
+jdx operation set --directory "$operation_dir" \
+  --id "$operation_id" --state PROCESSES_STOPPED
+```
+
+Every update uses a temporary file plus atomic rename. After any disconnect, a
+new read-only call can recover the last confirmed state:
+
+```bash
+jdx operation get --directory "$operation_dir" --id "$operation_id"
+```
+
+Use separate, idempotent phases:
+
+1. **Validate:** read exact PID files, PPIDs, full commands, working
+   directories, application state, checkpoints, and resource ownership. Do not
+   mutate anything.
+2. **Stop:** revalidate only the exact approved PIDs, send normal `TERM`, and
+   verify exit. Report survivors; do not automatically escalate to `KILL` or a
+   broad process match.
+3. **Deploy and recover:** proceed only when the prior workload is confirmed
+   stopped. Deploy tested files, validate versions/configuration, resume from
+   the intended checkpoint, and verify the new process tree and resource map.
+
+The status file records a confirmed boundary. If it shows the state before a
+mutation, inspect the real system before deciding whether the mutation ran;
+never blindly repeat a kill, overwrite, or launch.
+
 ## Long-running jobs
 
 Prefer a documented remote launcher that writes:

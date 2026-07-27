@@ -45,7 +45,8 @@ $ jdx exec -- python -V
 |---|---|
 | **Direct** | Calls Jupyter Server directly instead of driving the web UI. |
 | **Agent-friendly** | Every noninteractive command returns compact, parseable JSON. |
-| **Persistent** | Reconnect to the same named shell and keep its environment and processes. |
+| **Recoverable** | Reconnects the same terminal after transport loss without resending the command. |
+| **Isolated** | Runs each `exec` command in a child shell so `set -e` or `exit` cannot kill the control shell. |
 | **Interactive** | Open an SSH-like local TTY and detach with `Ctrl-]`. |
 | **Deliberate** | Never guesses a terminal, bulk-deletes sessions, or kills a process on timeout. |
 | **Privacy-first** | Hides endpoints, paths, credentials, and executed commands from default diagnostics. |
@@ -135,6 +136,12 @@ jdx shell
 Inside `jdx shell`, press **`Ctrl-]`** to detach while leaving the remote shell
 and its child processes running.
 
+For a multi-stage mutation, create an atomic remote checkpoint:
+
+```bash
+jdx operation begin --directory /workspace/project/logs/jupydex_ops
+```
+
 ## Command map
 
 | Command | Purpose | Mutates remote state? |
@@ -148,6 +155,7 @@ and its child processes running.
 | `jdx watch` | Read recent/live terminal output | No |
 | `jdx send` | Send text or a control key | Yes |
 | `jdx interrupt` | Send `Ctrl-C` to the selected terminal | Yes |
+| `jdx operation` | Begin, read, or atomically update a durable operation state | Yes |
 | `jdx close --yes` | Delete the selected terminal session | Yes |
 
 Run `jdx <command> --help` for every option.
@@ -178,6 +186,25 @@ Configuration and transport errors are printed to stderr:
   "message": "Jupyter rejected authentication (403)"
 }
 ```
+
+If the WebSocket disappears after command dispatch and three reconnects still
+cannot find the completion marker, Jupydex does not claim the command failed:
+
+```json
+{
+  "ok": false,
+  "error": "RemoteOutcomeUnknownError",
+  "message": "WebSocket closed before completion marker; terminal=agent_shell; remote outcome unknown; terminal retained for recovery",
+  "terminal": "agent_shell",
+  "remote_outcome": "unknown",
+  "terminal_retained": true,
+  "reconnect_attempts": 3
+}
+```
+
+The command is never resent during recovery and the terminal is never
+automatically deleted. Inspect durable state or reconnect to the exact terminal
+before deciding whether a mutation should be retried.
 
 A remote nonzero exit is stored in `result.exit_code`; it does not turn the
 local `jdx` process into a transport failure. Agent integrations should parse
@@ -228,6 +255,10 @@ the credential as equivalent to shell access for that Jupyter account.
 - Use one dedicated terminal name per agent or workflow.
 - A timeout does not kill a remote process unless
   `--interrupt-on-timeout` is explicitly used.
+- An unconfirmed result retains the terminal and is reported as
+  `remote_outcome: "unknown"`.
+- Split read-only verification, stopping, and deployment into separate,
+  idempotent phases with `jdx operation` checkpoints.
 - `close` requires `--yes` and affects only the exact terminal name.
 
 Read [SECURITY.md](SECURITY.md) before exposing Jupyter beyond loopback.
