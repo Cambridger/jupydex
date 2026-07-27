@@ -11,7 +11,11 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import __version__
-from .client import GatewayError, JupyterTerminalClient
+from .client import (
+    GatewayError,
+    JupyterTerminalClient,
+    RemoteOutcomeUnknownError,
+)
 from .config import (
     ConfigurationError,
     Settings,
@@ -146,6 +150,51 @@ def build_parser() -> argparse.ArgumentParser:
     interrupt.add_argument("--terminal", help="terminal name; defaults to JUPYDEX_TERMINAL")
     interrupt.add_argument("--listen-seconds", type=float, default=1.0)
 
+    operation = subparsers.add_parser(
+        "operation",
+        help="manage an atomic remote operation status file",
+    )
+    operation.add_argument(
+        "--terminal",
+        help="terminal name; defaults to JUPYDEX_TERMINAL",
+    )
+    operation_actions = operation.add_subparsers(
+        dest="operation_action",
+        required=True,
+    )
+    operation_begin = operation_actions.add_parser(
+        "begin",
+        help="create a unique operation and atomically write STARTED",
+    )
+    operation_begin.add_argument(
+        "--directory",
+        required=True,
+        help="remote directory for <operation-id>.status files",
+    )
+    operation_begin.add_argument(
+        "--id",
+        dest="operation_id",
+        help="explicit operation ID; defaults to a random UUID",
+    )
+    operation_begin.add_argument("--timeout", type=float, default=30.0)
+
+    operation_get = operation_actions.add_parser(
+        "get",
+        help="read the last atomically recorded operation state",
+    )
+    operation_get.add_argument("--directory", required=True)
+    operation_get.add_argument("--id", dest="operation_id", required=True)
+    operation_get.add_argument("--timeout", type=float, default=30.0)
+
+    operation_set = operation_actions.add_parser(
+        "set",
+        help="atomically replace an operation state",
+    )
+    operation_set.add_argument("--directory", required=True)
+    operation_set.add_argument("--id", dest="operation_id", required=True)
+    operation_set.add_argument("--state", required=True)
+    operation_set.add_argument("--timeout", type=float, default=30.0)
+
     close = subparsers.add_parser("close", help="delete a Jupyter terminal")
     close.add_argument("--terminal", help="terminal name; defaults to JUPYDEX_TERMINAL")
     close.add_argument(
@@ -220,6 +269,33 @@ async def _run(args: argparse.Namespace, settings: Settings) -> dict[str, Any] |
             return await client.interrupt(
                 _terminal(args, settings),
                 listen_seconds=args.listen_seconds,
+            )
+        if args.action == "operation":
+            name = _terminal(args, settings)
+            if args.operation_action == "begin":
+                return await client.begin_operation(
+                    name,
+                    args.directory,
+                    operation_id=args.operation_id,
+                    timeout=args.timeout,
+                )
+            if args.operation_action == "get":
+                return await client.get_operation_state(
+                    name,
+                    args.directory,
+                    args.operation_id,
+                    timeout=args.timeout,
+                )
+            if args.operation_action == "set":
+                return await client.set_operation_state(
+                    name,
+                    args.directory,
+                    args.operation_id,
+                    args.state,
+                    timeout=args.timeout,
+                )
+            raise AssertionError(
+                f"unhandled operation action: {args.operation_action}"
             )
         if args.action == "close":
             name = _terminal(args, settings)
@@ -325,6 +401,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             "error": type(exc).__name__,
             "message": str(exc),
         }
+        if isinstance(exc, RemoteOutcomeUnknownError):
+            payload.update(
+                {
+                    "terminal": exc.terminal,
+                    "remote_outcome": exc.remote_outcome,
+                    "terminal_retained": exc.terminal_retained,
+                    "reconnect_attempts": exc.reconnect_attempts,
+                }
+            )
+            if exc.operation_id is not None:
+                payload["operation_id"] = exc.operation_id
         print(json.dumps(payload, ensure_ascii=False), file=sys.stderr)
         return 2
     except KeyboardInterrupt:

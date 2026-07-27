@@ -43,7 +43,8 @@ $ jdx exec -- python -V
 |---|---|
 | 直接连接 | 调用 Jupyter Server，不操作网页 UI |
 | 适合智能体 | 非交互命令统一返回可解析 JSON |
-| 会话持久化 | 使用固定名称重连同一个 shell，保留环境和后台进程 |
+| 断线恢复 | 传输中断后重连同一个终端，且绝不重复发送命令 |
+| 命令隔离 | 每条 `exec` 在子 shell 中运行，`set -e` 或 `exit` 不会关闭控制 shell |
 | 交互终端 | 提供类似 SSH 的本地 TTY，按 `Ctrl-]` 安全脱离 |
 | 安全边界明确 | 不猜测终端、不批量删除、超时默认不杀远程进程 |
 | 默认脱敏 | 诊断结果隐藏地址、目录和凭据，执行结果默认不回显命令 |
@@ -147,6 +148,7 @@ jdx shell
 | `jdx watch` | 读取最近或实时终端输出 |
 | `jdx send` | 发送文本或控制键 |
 | `jdx interrupt` | 向指定终端发送 `Ctrl-C` |
+| `jdx operation` | 创建、读取或原子更新远程操作状态 |
 | `jdx close --yes` | 删除指定终端会话 |
 
 使用 `jdx <命令> --help` 查看完整参数。
@@ -172,6 +174,22 @@ jdx shell
 不要只检查本地 `$?`。执行的完整命令默认不会出现在 JSON 中；只有明确使用
 `--show-command` 才会显示。
 
+如果命令发送后 WebSocket 中断，并且三次重连仍无法确认完成标记，Jupydex
+会返回 `RemoteOutcomeUnknownError`、`remote_outcome: "unknown"` 和
+`terminal_retained: true`。它不会重复发送原命令，也不会自动删除终端。
+此时必须先读取远程状态、日志或精确进程信息，不能把断线当作命令失败后直接
+重试。
+
+多阶段变更可以先创建持久化检查点：
+
+```bash
+jdx operation begin --directory /workspace/project/logs/jupydex_ops
+```
+
+随后用 `operation set` 原子记录 `PIDS_VERIFIED`、`TERM_SENT`、
+`FILES_DEPLOYED`、`COMPLETE` 等状态。完整流程见
+[智能体集成文档](docs/agent-integration.md#可恢复的变更操作)。
+
 ## 安全建议
 
 - 使用专用的、非 root 系统账户运行 Jupyter。
@@ -180,6 +198,8 @@ jdx shell
 - 保持 TLS 证书校验；私有证书使用 `--ca-bundle`。
 - 每个智能体或工作流使用独立终端名。
 - 超时默认不会终止远程命令；只有 `--interrupt-on-timeout` 才发送 `Ctrl-C`。
+- 断线且结果未确认时保留原终端，先核验状态，禁止盲目重复变更命令。
+- PID 核验、停止、部署和重启应拆成独立、可恢复的幂等阶段。
 - `close` 必须带 `--yes`，并且只删除精确指定的终端。
 
 公开服务器前请完整阅读 [SECURITY.md](SECURITY.md)。

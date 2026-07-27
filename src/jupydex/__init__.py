@@ -1,7 +1,11 @@
 """Jupydex: a scriptable Jupyter terminal gateway."""
 
-from .client import JupyterTerminalClient
+from .client import JupyterTerminalClient, RemoteOutcomeUnknownError
 from .config import Settings
 
-__all__ = ["JupyterTerminalClient", "Settings"]
-__version__ = "0.2.0"
+__all__ = [
+    "JupyterTerminalClient",
+    "RemoteOutcomeUnknownError",
+    "Settings",
+]
+__version__ = "0.3.0"

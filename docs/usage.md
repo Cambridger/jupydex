@@ -113,8 +113,11 @@ The precedence is:
 jdx exec --cwd /workspace/other-project -- pwd
 ```
 
-The shell remains persistent, so exports and directory changes made by a
-command can affect later calls.
+Every `exec` command runs inside an independent `bash -lc` child shell. Shell
+options such as `set -e`, `exit`, exports, and directory changes affect that
+command only; they cannot terminate or mutate the outer terminal shell that
+prints Jupydex's completion marker. Use `shell` or deliberate `send` calls when
+you specifically need interactive shell state to persist.
 
 ### Timeouts
 
@@ -171,6 +174,92 @@ jdx exec --show-command -- python -V
 ```
 
 Command output may still contain secrets produced by the remote program.
+
+### Disconnect recovery
+
+After a command is dispatched, Jupydex searches accumulated output so a
+completion marker split across WebSocket frames is still recognized. Empty,
+binary, and non-JSON frames are handled defensively. Non-JSON data is retained
+with a `[JUPYDEX_NON_JSON_FRAME]` annotation instead of causing a JSON decoder
+crash.
+
+For a transient transport loss, Jupydex reconnects the same named terminal up
+to three times with 1, 2, and 4 second delays. It never creates a replacement
+terminal and never resends the command. Reconnect scrollback is searched for
+the original completion marker.
+
+If completion still cannot be confirmed, the CLI exits locally with code `2`
+and reports:
+
+```json
+{
+  "ok": false,
+  "error": "RemoteOutcomeUnknownError",
+  "remote_outcome": "unknown",
+  "terminal": "agent_shell",
+  "terminal_retained": true,
+  "reconnect_attempts": 3
+}
+```
+
+This means the remote command may not have started, may be partially complete,
+or may have completed without its marker reaching the client. Do not repeat a
+mutation until you inspect its durable state. `exec` never deletes its terminal
+automatically; `close --yes` remains a separate explicit action.
+
+## Durable operation state
+
+Use operation status files for stop, deploy, restart, migration, or other
+multi-stage mutations. Begin creates a local UUID and atomically writes
+`STARTED` on the Jupyter host:
+
+```bash
+payload=$(jdx operation begin \
+  --directory /workspace/project/logs/jupydex_ops)
+operation_id=$(printf '%s' "$payload" | jq -r '.result.operation_id')
+```
+
+Read or atomically replace the state:
+
+```bash
+jdx operation get \
+  --directory /workspace/project/logs/jupydex_ops \
+  --id "$operation_id"
+
+jdx operation set \
+  --directory /workspace/project/logs/jupydex_ops \
+  --id "$operation_id" \
+  --state PIDS_VERIFIED
+```
+
+States must use uppercase ASCII letters, digits, and underscores. A practical
+sequence is:
+
+```text
+STARTED
+PIDS_VERIFIED
+TERM_SENT
+PROCESSES_STOPPED
+FILES_DEPLOYED
+CONTROLLER_RESTARTED
+COMPLETE
+```
+
+Each update writes a unique temporary file in the status directory and renames
+it over `<operation-id>.status`, so readers see an atomic checkpoint. The
+checkpoint is the last confirmed boundary, not a substitute for verifying the
+real system. If a connection is lost with state `PIDS_VERIFIED`, re-check the
+exact PID, PPID, command line, working directory, and application state before
+deciding whether `TERM` was sent.
+
+Keep at least three idempotent phases:
+
+1. read-only validation of exact processes, state, metrics, checkpoints, and
+   resource ownership;
+2. an exact normal stop that revalidates selected PIDs, sends only `TERM`, and
+   reports survivors without escalating to broad `pkill` or `KILL`;
+3. deployment and recovery only after the old workload is confirmed stopped,
+   followed by version, process-tree, and resource-mapping verification.
 
 ## Interactive shell
 
@@ -281,6 +370,12 @@ retains the data it receives.
 
 This is expected. Inspect the job using its own status file, logs, or a verified
 PID. Use `--interrupt-on-timeout` only when interruption is authorized.
+
+### Remote outcome unknown
+
+Keep the terminal. Query `jdx operation get`, durable logs, exact PIDs, and
+application state through a read-only connection. Never infer failure from the
+client exception and never blindly resend a stop, deploy, or restart command.
 
 ### Plaintext warning
 
