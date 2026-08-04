@@ -8,11 +8,16 @@ Jupydex is called by automation.
 ```bash
 jdx --version
 jdx --pretty doctor
+jdx --proxy none doctor --websocket
 jdx <command> --help
 ```
 
 `--pretty` formats JSON for humans. Compact JSON is the default for agents.
 `JUPYDEX_PRETTY=1` has the same effect.
+
+`--proxy` is a global, one-call override and must appear before the subcommand.
+It accepts `auto`, `none`, or an explicit HTTP/SOCKS5 proxy URL. See
+[Proxy behavior](#proxy-behavior).
 
 ## Diagnose the connection
 
@@ -28,6 +33,14 @@ directory, and private CA path:
   "ok": true,
   "result": {
     "connected": true,
+    "rest_connected": true,
+    "websocket_connected": null,
+    "websocket": {
+      "checked": false,
+      "connected": null,
+      "proxy_mode": "direct_from_environment",
+      "reason": "run doctor --websocket to test the handshake"
+    },
     "terminal_count": 2,
     "configured_terminal": {
       "configured": true,
@@ -36,7 +49,8 @@ directory, and private CA path:
     "config": {
       "base_url": "https://<redacted>",
       "authentication": "token",
-      "transport_security": "TLS"
+      "transport_security": "TLS",
+      "proxy_mode": "auto"
     }
   }
 }
@@ -49,6 +63,42 @@ jdx doctor --show-config
 ```
 
 That option reveals endpoint and path metadata, but never the token or cookie.
+
+Test the terminal WebSocket handshake separately from REST:
+
+```bash
+jdx doctor --websocket
+jdx doctor --websocket --terminal agent_shell
+```
+
+The check only opens and closes the terminal channel; it sends no terminal
+input. The selected terminal must already exist. A WebSocket failure is
+returned inside the successful doctor result so automation can observe
+`rest_connected: true` together with `websocket_connected: false`.
+
+## Proxy behavior
+
+The selected policy always applies to both REST and WebSocket traffic:
+
+- `auto` uses `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`;
+- `none` disables environment proxy discovery and connects directly;
+- an explicit `http://`, `https://`, `socks5://`, or `socks5h://` URL is used
+  for both transports.
+
+Precedence is one-call `--proxy`, then `JUPYDEX_PROXY`, then saved
+`proxy_mode`, then the default `auto`.
+
+```bash
+jdx --proxy auto doctor --websocket
+jdx --proxy none list
+jdx --proxy socks5://proxy.example:1080 doctor --websocket
+```
+
+Install the `jupydex[socks]` extra for SOCKS routes. If it is missing, the CLI
+returns a structured `ProxySupportError` with a redacted proxy type and safe
+remediation. Proxy URLs and credentials never appear in the diagnostic. Avoid
+putting authenticated URLs on the command line; use the private config or a
+secret manager. Do not choose `none` unless a trusted direct route is intended.
 
 ## List terminals
 
@@ -350,6 +400,13 @@ successful Jupydex envelope with `exit_code: 1`.
 Run `jdx doctor`. Reconfigure with the server base URL and a current token or
 cookie. Jupydex disables automatic HTTP redirects so login redirects are
 reported rather than silently followed.
+
+### SOCKS proxy support unavailable
+
+Inspect the redacted `proxy_mode` in `jdx doctor --websocket`. For an intended
+direct connection, add the Jupyter hostname to `NO_PROXY`. For a required
+SOCKS route, install `jupydex[socks]`. Use `jdx --proxy none ...` only after
+confirming that bypassing the environment proxy is safe.
 
 ### Terminal not found
 

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Callable
+from unittest import mock
 
 import httpx
 import websockets
@@ -15,6 +17,7 @@ from jupydex.client import (
     AuthenticationError,
     GatewayError,
     JupyterTerminalClient,
+    ProxySupportError,
     RemoteOutcomeUnknownError,
     validate_operation_id,
     validate_operation_state,
@@ -115,7 +118,48 @@ class _FailingCloseConnection(_FakeConnection):
         raise WebSocketException("close failed")
 
 
+class _MissingSocksConnection:
+    async def __aenter__(self) -> object:
+        raise ImportError(
+            "python-socks is required for SOCKS proxy support but isn't installed"
+        )
+
+    async def __aexit__(self, *_: object) -> None:
+        return None
+
+
 class ClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rest_client_receives_the_same_explicit_proxy_policy(self) -> None:
+        proxy = "socks5://user:secret@proxy.example:1080"
+        with mock.patch("jupydex.client.httpx.AsyncClient") as constructor:
+            JupyterTerminalClient(
+                Settings(
+                    base_url="https://example.test",
+                    proxy_mode=proxy,
+                )
+            )
+        kwargs = constructor.call_args.kwargs
+        self.assertEqual(kwargs["proxy"], proxy)
+        self.assertFalse(kwargs["trust_env"])
+
+    async def test_rest_missing_socks_dependency_is_structured(self) -> None:
+        error = ImportError(
+            "Using SOCKS proxy, but the socksio package is not installed"
+        )
+        with mock.patch(
+            "jupydex.client.httpx.AsyncClient",
+            side_effect=error,
+        ):
+            with self.assertRaises(ProxySupportError) as raised:
+                JupyterTerminalClient(
+                    Settings(
+                        base_url="https://example.test",
+                        proxy_mode="socks5://proxy.example:1080",
+                    )
+                )
+        self.assertEqual(raised.exception.proxy_mode, "explicit_socks")
+        self.assertNotIn("proxy.example", str(raised.exception))
+
     async def test_terminal_name_rejects_hyphens_before_network_access(self) -> None:
         with self.assertRaises(GatewayError):
             validate_terminal_name("agent-terminal")
@@ -151,10 +195,139 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         )
         result = await client.status()
         self.assertTrue(result["connected"])
+        self.assertTrue(result["rest_connected"])
+        self.assertIsNone(result["websocket_connected"])
+        self.assertFalse(result["websocket"]["checked"])
         self.assertEqual(result["terminal_count"], 1)
         self.assertEqual(
             result["config"]["base_url"], "https://<redacted>"
         )
+        await http.aclose()
+
+    async def test_doctor_reports_websocket_handshake_separately(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            payload: object = (
+                {"connections": 1}
+                if request.url.path.endswith("/api/status")
+                else [{"name": "codex"}]
+            )
+            return httpx.Response(
+                200,
+                json=payload,
+                headers={"content-type": "application/json"},
+            )
+
+        seen: dict[str, object] = {}
+
+        def connector(_: str, **kwargs: object) -> _FakeConnection:
+            seen.update(kwargs)
+            return _FakeConnection(_FakeWebSocket([]))
+
+        http = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url="https://example.test/",
+        )
+        client = JupyterTerminalClient(
+            Settings(
+                base_url="https://example.test",
+                terminal="codex",
+                proxy_mode="none",
+            ),
+            http_client=http,
+            connector=connector,
+        )
+        result = await client.status(check_websocket=True)
+        self.assertTrue(result["rest_connected"])
+        self.assertTrue(result["websocket_connected"])
+        self.assertTrue(result["websocket"]["checked"])
+        self.assertIsNone(seen["proxy"])
+        await http.aclose()
+
+    async def test_doctor_redacts_missing_socks_dependency(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            payload: object = (
+                {"connections": 1}
+                if request.url.path.endswith("/api/status")
+                else [{"name": "codex"}]
+            )
+            return httpx.Response(
+                200,
+                json=payload,
+                headers={"content-type": "application/json"},
+            )
+
+        seen: dict[str, object] = {}
+
+        def connector(_: str, **kwargs: object) -> _MissingSocksConnection:
+            seen.update(kwargs)
+            return _MissingSocksConnection()
+
+        proxy = "socks5://user:secret@proxy.example:1080"
+        http = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url="https://jupyter.example/",
+        )
+        client = JupyterTerminalClient(
+            Settings(
+                base_url="https://jupyter.example",
+                terminal="codex",
+                proxy_mode=proxy,
+            ),
+            http_client=http,
+            connector=connector,
+        )
+        result = await client.status(check_websocket=True)
+        rendered = repr(result)
+        self.assertTrue(result["rest_connected"])
+        self.assertFalse(result["websocket_connected"])
+        self.assertEqual(
+            result["websocket"]["error"],
+            ProxySupportError.__name__,
+        )
+        self.assertEqual(result["websocket"]["proxy_mode"], "explicit_socks")
+        self.assertEqual(seen["proxy"], proxy)
+        self.assertNotIn("proxy.example", rendered)
+        self.assertNotIn("secret", rendered)
+        self.assertNotIn("jupyter.example", rendered)
+        await http.aclose()
+
+    async def test_doctor_uses_available_explicit_socks_connector(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            payload: object = (
+                {"connections": 1}
+                if request.url.path.endswith("/api/status")
+                else [{"name": "codex"}]
+            )
+            return httpx.Response(
+                200,
+                json=payload,
+                headers={"content-type": "application/json"},
+            )
+
+        proxy = "socks5://proxy.example:1080"
+        seen: dict[str, object] = {}
+
+        def connector(_: str, **kwargs: object) -> _FakeConnection:
+            seen.update(kwargs)
+            return _FakeConnection(_FakeWebSocket([]))
+
+        http = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url="https://example.test/",
+        )
+        client = JupyterTerminalClient(
+            Settings(
+                base_url="https://example.test",
+                terminal="codex",
+                proxy_mode=proxy,
+            ),
+            http_client=http,
+            connector=connector,
+        )
+        result = await client.status(check_websocket=True)
+        self.assertTrue(result["websocket_connected"])
+        self.assertEqual(seen["proxy"], proxy)
+        self.assertEqual(result["websocket"]["proxy_mode"], "explicit_socks")
         await http.aclose()
 
     async def test_login_redirect_is_an_authentication_error(self) -> None:
@@ -169,6 +342,30 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(AuthenticationError):
             await client.list_terminals()
+        await http.aclose()
+
+    async def test_http_error_never_reflects_token_or_response_body(self) -> None:
+        token = "private-test-token"
+
+        def handler(_: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                500,
+                text=f"upstream reflected {token}",
+                headers={"content-type": "text/plain"},
+            )
+
+        http = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url="https://example.test/",
+        )
+        client = JupyterTerminalClient(
+            Settings(base_url="https://example.test", token=token),
+            http_client=http,
+        )
+        with self.assertRaises(GatewayError) as raised:
+            await client.list_terminals()
+        self.assertNotIn(token, str(raised.exception))
+        self.assertNotIn("upstream reflected", str(raised.exception))
         await http.aclose()
 
     async def test_execute_reads_exit_marker(self) -> None:
@@ -471,16 +668,30 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             ),
             base_url=f"http://127.0.0.1:{port}/",
         )
-        client = JupyterTerminalClient(
-            Settings(base_url=f"http://127.0.0.1:{port}", token="test-token"),
-            http_client=http,
-        )
-        try:
-            result = await client.execute("codex_terminal", "true", timeout=2)
-        finally:
-            server.close()
-            await server.wait_closed()
-            await http.aclose()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ALL_PROXY": "socks5://127.0.0.1:9",
+                "NO_PROXY": "127.0.0.1",
+                "no_proxy": "127.0.0.1",
+            },
+            clear=True,
+        ):
+            client = JupyterTerminalClient(
+                Settings(
+                    base_url=f"http://127.0.0.1:{port}",
+                    token="test-token",
+                ),
+                http_client=http,
+            )
+            try:
+                result = await client.execute(
+                    "codex_terminal", "true", timeout=2
+                )
+            finally:
+                server.close()
+                await server.wait_closed()
+                await http.aclose()
         self.assertEqual(result.output, "transport-ok")
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(seen["path"], "/terminals/websocket/codex_terminal")

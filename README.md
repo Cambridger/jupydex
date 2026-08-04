@@ -50,6 +50,7 @@ $ jdx exec -- python -V
 | **Interactive** | Open an SSH-like local TTY and detach with `Ctrl-]`. |
 | **Deliberate** | Never guesses a terminal, bulk-deletes sessions, or kills a process on timeout. |
 | **Privacy-first** | Hides endpoints, paths, credentials, and executed commands from default diagnostics. |
+| **Proxy-aware** | Applies one `auto`, `none`, HTTP, or SOCKS policy to both REST and WebSocket traffic. |
 
 ## How it works
 
@@ -91,7 +92,7 @@ jdx --version
 ```
 
 See the [installation guide](docs/installation.md) for `uv`, source checkouts,
-upgrades, private CAs, SSH tunnels, and troubleshooting.
+upgrades, SOCKS support, private CAs, SSH tunnels, and troubleshooting.
 
 ### 2. Configure privately
 
@@ -206,6 +207,16 @@ The command is never resent during recovery and the terminal is never
 automatically deleted. Inspect durable state or reconnect to the exact terminal
 before deciding whether a mutation should be retried.
 
+To verify both transports without executing a command, run:
+
+```bash
+jdx doctor --websocket
+```
+
+The result reports `rest_connected` and `websocket_connected` separately. A
+WebSocket check requires an existing configured terminal, or an explicit
+`--terminal` value.
+
 A remote nonzero exit is stored in `result.exit_code`; it does not turn the
 local `jdx` process into a transport failure. Agent integrations should parse
 the JSON instead of relying only on `$?`. Full commands are omitted from JSON
@@ -223,6 +234,7 @@ Jupydex supports:
 - JupyterHub base paths such as `/user/alice`;
 - private certificate authorities;
 - environment-variable overrides;
+- unified REST and WebSocket proxy handling;
 - an explicit WebSocket `Origin` override.
 
 Environment variables take precedence over the saved profile:
@@ -237,11 +249,25 @@ Environment variables take precedence over the saved profile:
 | `JUPYDEX_VERIFY_TLS` | `true` by default |
 | `JUPYDEX_CA_BUNDLE` | Private CA certificate bundle |
 | `JUPYDEX_ORIGIN` | WebSocket Origin override |
+| `JUPYDEX_PROXY` | `auto` (default), `none`, or an explicit HTTP/SOCKS5 proxy URL |
 | `JUPYDEX_TIMEOUT` | HTTP/open timeout in seconds |
 | `JUPYDEX_CONFIG` | Alternate config path; empty disables file loading |
 
 See [`.env.example`](.env.example) for synthetic values. Never commit a real
 `.env` file.
+
+`auto` honors the standard `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and
+`NO_PROXY` environment. Use a one-call override before the subcommand:
+
+```bash
+jdx --proxy none doctor --websocket
+jdx --proxy socks5://proxy.example:1080 list
+```
+
+Install `jupydex[socks]` when a SOCKS route is required. Jupydex diagnostics
+report only a redacted proxy type, never the proxy URL or credentials. Use
+`none` only when bypassing the environment proxy is an intentional, trusted
+network decision.
 
 ## Security model
 

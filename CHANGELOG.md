@@ -2,6 +2,21 @@
 
 All notable changes to Jupydex are documented here.
 
+## 0.4.0 - 2026-08-04
+
+- Added a unified `auto`, `none`, or explicit proxy policy for HTTP REST and
+  terminal WebSocket connections.
+- Added `JUPYDEX_PROXY`, the global `--proxy` override, and persisted
+  `jdx configure --proxy` settings.
+- Added the `socks` installation extra for both HTTPX and WebSocket SOCKS
+  dependencies.
+- Extended `doctor --websocket` to report REST and terminal WebSocket health
+  separately without sending terminal input.
+- Added structured, redacted proxy remediation and removed upstream response
+  bodies from error messages.
+- Added proxy, `NO_PROXY`, missing-dependency, handshake, and privacy regression
+  tests, including a real loopback WebSocket transport check.
+
 ## 0.3.0 - 2026-07-27
 
 - Isolated every `exec` command in a `bash -lc` child shell and captured its

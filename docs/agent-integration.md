@@ -9,7 +9,7 @@ framing, and terminal output cleanup.
 An agent integration should:
 
 1. use a dedicated terminal name;
-2. run `doctor` before the first mutation;
+2. run `doctor --websocket` before the first mutation;
 3. prefer `exec` over keystroke-level `send`;
 4. parse `result.exit_code` and `result.timed_out`;
 5. keep durable job output in remote log files;
@@ -115,6 +115,20 @@ Typical `exec` result:
 | `command` | string, opt-in | Present only with `--show-command` |
 
 Do not store the complete payload unless remote output is safe to retain.
+
+## Connection diagnostics
+
+`jdx doctor --websocket` reports `rest_connected` and `websocket_connected`
+separately. A result with REST `true` and WebSocket `false` is a transport
+configuration failure and is not permission to fall back to browser
+automation or resend a mutation through another terminal.
+
+When a SOCKS dependency is unavailable, stderr or the WebSocket diagnostic
+contains `ProxySupportError`, a redacted `proxy_mode`, and a `remediation`
+array. Integrations may display those fields. They must not reconstruct or log
+proxy environment values. Configure proxy behavior with `JUPYDEX_PROXY` or a
+saved private profile; authenticated proxy URLs should come from a secret
+manager rather than command arguments.
 
 ## Unknown remote outcomes
 

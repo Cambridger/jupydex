@@ -54,11 +54,28 @@ See:
   output, or captured command results.
 - Jupydex rejects a credential-bearing config file unless its POSIX
   permissions exclude group and other access.
+- An explicit proxy URL is treated as sensitive configuration even when it
+  currently contains no password, because proxy credentials may be added later.
 - `doctor` redacts endpoint and path metadata by default.
+- Proxy diagnostics expose only a category such as `explicit_socks` or
+  `socks_from_environment`, never a proxy address or credentials.
 - `exec` omits the executed command from JSON by default.
 - `exec` isolates user commands in a child shell, reconnects the same terminal
   without resending, and retains the terminal when completion is unconfirmed.
 - The local config is permission-protected, not encrypted.
+
+## Proxy trust boundary
+
+The default `auto` mode follows standard proxy environment variables and
+`NO_PROXY` for both REST and WebSocket traffic. Environment variables are part
+of the client machine's trust boundary: a malicious local process that can
+replace them may redirect Jupyter traffic. Keep TLS verification enabled so an
+untrusted proxy cannot impersonate the Jupyter server.
+
+An explicit proxy URL is applied to both transports. Store it only in the
+private config or a secret manager when it contains credentials. `--proxy
+none` disables environment proxy discovery for both transports; use it only
+after confirming that the direct route is intended and protected.
 
 If a credential appears in chat, an issue, CI output, terminal transcript,
 shell history, screenshot, or Git commit:

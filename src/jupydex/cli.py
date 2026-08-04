@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -14,12 +15,14 @@ from . import __version__
 from .client import (
     GatewayError,
     JupyterTerminalClient,
+    ProxySupportError,
     RemoteOutcomeUnknownError,
 )
 from .config import (
     ConfigurationError,
     Settings,
     default_config_path,
+    normalize_proxy_mode,
     normalize_server_url,
     save_config_file,
 )
@@ -45,6 +48,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="pretty-print JSON instead of compact JSON",
     )
+    parser.add_argument(
+        "--proxy",
+        dest="proxy_override",
+        metavar="auto|none|URL",
+        help=(
+            "override proxy handling for this call: auto uses environment "
+            "variables, none connects directly, or provide an explicit URL"
+        ),
+    )
     subparsers = parser.add_subparsers(dest="action", required=True)
 
     configure = subparsers.add_parser(
@@ -66,6 +78,13 @@ def build_parser() -> argparse.ArgumentParser:
     configure.add_argument("--terminal", help="dedicated terminal name")
     configure.add_argument("--cwd", help="default remote working directory")
     configure.add_argument("--origin", help="override WebSocket Origin")
+    configure.add_argument(
+        "--proxy",
+        dest="saved_proxy",
+        default="auto",
+        metavar="auto|none|URL",
+        help="proxy policy to save; defaults to auto",
+    )
     configure.add_argument("--ca-bundle", help="private CA certificate bundle")
     configure.add_argument(
         "--no-verify-tls",
@@ -89,6 +108,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--show-config",
         action="store_true",
         help="include endpoint, terminal name, and remote paths in output",
+    )
+    doctor.add_argument(
+        "--websocket",
+        action="store_true",
+        help="also test a terminal WebSocket handshake",
+    )
+    doctor.add_argument(
+        "--terminal",
+        help="terminal for the handshake; defaults to JUPYDEX_TERMINAL",
     )
     subparsers.add_parser("list", help="list Jupyter terminal sessions")
 
@@ -218,7 +246,11 @@ def _terminal(args: argparse.Namespace, settings: Settings) -> str:
 async def _run(args: argparse.Namespace, settings: Settings) -> dict[str, Any] | list[Any]:
     async with JupyterTerminalClient(settings) as client:
         if args.action == "doctor":
-            return await client.status(reveal_sensitive=args.show_config)
+            return await client.status(
+                reveal_sensitive=args.show_config,
+                check_websocket=args.websocket,
+                terminal=args.terminal,
+            )
         if args.action == "list":
             return await client.list_terminals()
         if args.action == "shell":
@@ -316,6 +348,7 @@ def _configure(args: argparse.Namespace) -> dict[str, Any]:
         if not raw_url:
             raise ConfigurationError("no JupyterLab URL was provided")
     base_url, url_token = normalize_server_url(raw_url)
+    proxy_mode = normalize_proxy_mode(args.saved_proxy)
     if args.url is not None and url_token:
         raise ConfigurationError(
             "refusing a token in --url because command-line arguments may be "
@@ -345,6 +378,7 @@ def _configure(args: argparse.Namespace) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "url": base_url,
         "verify_tls": not args.no_verify_tls,
+        "proxy_mode": proxy_mode,
     }
     if args.auth == "token":
         payload["token"] = credential
@@ -364,6 +398,7 @@ def _configure(args: argparse.Namespace) -> dict[str, Any]:
         ca_bundle=Path(args.ca_bundle).expanduser() if args.ca_bundle else None,
         terminal=args.terminal,
         cwd=args.cwd,
+        proxy_mode=proxy_mode,
     )
     return {
         "config_saved": True,
@@ -394,6 +429,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = _configure(args)
         else:
             settings = Settings.from_env()
+            if args.proxy_override is not None:
+                settings = replace(
+                    settings,
+                    proxy_mode=normalize_proxy_mode(args.proxy_override),
+                )
             result = asyncio.run(_run(args, settings))
     except (ConfigurationError, GatewayError, OSError) as exc:
         payload = {
@@ -412,6 +452,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             if exc.operation_id is not None:
                 payload["operation_id"] = exc.operation_id
+        if isinstance(exc, ProxySupportError):
+            payload.update(
+                {
+                    "proxy_mode": exc.proxy_mode,
+                    "remediation": exc.remediation,
+                }
+            )
         print(json.dumps(payload, ensure_ascii=False), file=sys.stderr)
         return 2
     except KeyboardInterrupt:
