@@ -67,6 +67,20 @@ python -m pip install --upgrade pip
 python -m pip install git+https://github.com/Cambridger/jupydex.git
 ```
 
+If the route to Jupyter uses a SOCKS5 proxy, install the optional transport
+dependencies at the same time:
+
+```bash
+python -m pip install \
+  'jupydex[socks] @ git+https://github.com/Cambridger/jupydex.git'
+```
+
+For an existing pipx installation:
+
+```bash
+pipx inject jupydex 'httpx[socks]>=0.27' 'python-socks[asyncio]>=2'
+```
+
 On Windows PowerShell, activate with:
 
 ```powershell
@@ -161,6 +175,10 @@ Jupydex creates the directory with mode `0700` and the file with mode `0600`.
 It refuses to load a credential-bearing file readable by group or other users.
 The file is permission-protected, not encrypted.
 
+An explicit proxy URL is also treated as sensitive data, because it may contain
+credentials. A config containing one must retain mode `0600` even if the
+current URL has no password.
+
 Use another profile:
 
 ```bash
@@ -180,6 +198,48 @@ jdx doctor
 
 For automation, inject real credentials from a secret manager rather than a
 committed `.env` file.
+
+## Proxy configuration
+
+Jupydex uses one policy for both the Jupyter REST API and terminal WebSocket:
+
+| Mode | REST | WebSocket |
+|---|---|---|
+| `auto` | Uses standard proxy environment variables | Uses the same environment and `NO_PROXY` bypass rules |
+| `none` | Ignores environment proxies | Connects directly |
+| `http://...` or `https://...` | Uses the explicit proxy | Uses the same explicit proxy |
+| `socks5://...` or `socks5h://...` | Uses the explicit SOCKS proxy | Uses the same explicit SOCKS proxy |
+
+`auto` is the default. It reads `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and
+their lowercase forms; `NO_PROXY` or `no_proxy` bypasses matching hosts.
+
+Save a policy:
+
+```bash
+jdx configure \
+  --url 'https://jupyter.example/user/alice' \
+  --terminal agent_shell \
+  --proxy auto
+```
+
+Use an environment override:
+
+```bash
+export JUPYDEX_PROXY=none
+```
+
+Or override only one invocation. Global options appear before the subcommand:
+
+```bash
+jdx --proxy none doctor --websocket
+jdx --proxy http://proxy.example:8080 list
+```
+
+Explicit proxy URLs may contain credentials, but command-line arguments can be
+visible in history and process listings. Prefer the private config or a secret
+manager. Diagnostics expose only the proxy category. `none` is not a generic
+fix: it bypasses organization proxy controls and should be used only for an
+intended, trusted direct route.
 
 ## Private certificate authority
 
@@ -234,6 +294,7 @@ Then create a dedicated session and run a harmless command:
 
 ```bash
 jdx create --name agent_shell
+jdx doctor --websocket
 jdx exec -- printf '%s\n' JUPYDEX_OK
 ```
 
@@ -253,6 +314,7 @@ environment's executable directly.
 ### `ModuleNotFoundError`
 
 Do not install with `--no-deps`. Jupydex requires `httpx` and `websockets`.
+SOCKS routes additionally require the `jupydex[socks]` extra.
 
 ### Login page or redirect
 
@@ -262,9 +324,15 @@ credential may have expired. `jdx configure` accepts copied `/lab/...` and
 
 ### WebSocket rejected but REST works
 
-Check the reverse proxy's WebSocket upgrade configuration, `Origin` policy,
-JupyterHub prefix, and certificate chain. Use `--origin` only when the server
-operator has specified the required value.
+Run `jdx doctor --websocket` to preserve the separate REST and WebSocket
+results. Check the proxy mode, `NO_PROXY`, reverse proxy WebSocket upgrade
+configuration, `Origin` policy, JupyterHub prefix, and certificate chain. Use
+`--origin` only when the server operator has specified the required value.
+
+If the result is `ProxySupportError`, either add the Jupyter host to `NO_PROXY`
+for an intended direct route, install `jupydex[socks]` for a required SOCKS
+route, or use `--proxy none` only after verifying that direct access is trusted.
+The error intentionally does not print the detected proxy address.
 
 ## Upstream documentation
 

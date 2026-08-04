@@ -7,10 +7,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qs, urlsplit, urlunsplit
+from urllib.request import getproxies, proxy_bypass
 
 
 class ConfigurationError(ValueError):
     """Raised when gateway configuration is missing or invalid."""
+
+
+_PROXY_SCHEMES = {
+    "http",
+    "https",
+    "socks5",
+    "socks5h",
+}
 
 
 def _as_bool(value: str | bool | None, default: bool) -> bool:
@@ -60,6 +69,35 @@ def normalize_server_url(raw_url: str) -> tuple[str, str | None]:
     return base_url.rstrip("/"), query_token
 
 
+def normalize_proxy_mode(raw_proxy: str | None) -> str:
+    """Return ``auto``, ``none``, or a validated explicit proxy URL."""
+    value = "auto" if raw_proxy is None else raw_proxy.strip()
+    normalized = value.lower()
+    if normalized in {"auto", "none"}:
+        return normalized
+    if not value:
+        raise ConfigurationError(
+            "proxy mode must be 'auto', 'none', or an explicit proxy URL"
+        )
+
+    parsed = urlsplit(value)
+    scheme = parsed.scheme.lower()
+    if scheme not in _PROXY_SCHEMES or not parsed.hostname:
+        raise ConfigurationError(
+            "proxy URL must use http, https, socks5, or socks5h and include "
+            "a host"
+        )
+    if parsed.query or parsed.fragment or parsed.path not in {"", "/"}:
+        raise ConfigurationError(
+            "proxy URL must not contain a path, query string, or fragment"
+        )
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ConfigurationError("proxy URL contains an invalid port") from exc
+    return urlunsplit((scheme, parsed.netloc, "", "", ""))
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     base_url: str
@@ -71,6 +109,7 @@ class Settings:
     request_timeout: float = 20.0
     terminal: str | None = None
     cwd: str | None = None
+    proxy_mode: str = "auto"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "Settings":
@@ -107,6 +146,9 @@ class Settings:
             raise ConfigurationError("JUPYDEX_TIMEOUT must be a number") from exc
         if request_timeout <= 0:
             raise ConfigurationError("JUPYDEX_TIMEOUT must be positive")
+        proxy_value = source.get("JUPYDEX_PROXY")
+        if proxy_value is None:
+            proxy_value = _config_string(config, "proxy_mode")
         return cls(
             base_url=base_url,
             token=token,
@@ -122,11 +164,12 @@ class Settings:
             terminal=source.get("JUPYDEX_TERMINAL")
             or _config_string(config, "terminal"),
             cwd=source.get("JUPYDEX_CWD") or _config_string(config, "cwd"),
+            proxy_mode=normalize_proxy_mode(proxy_value),
         )
 
     @property
     def http_headers(self) -> dict[str, str]:
-        headers = {"Accept": "application/json", "User-Agent": "jupydex/0.2"}
+        headers = {"Accept": "application/json", "User-Agent": "jupydex/0.4"}
         if self.token:
             headers["Authorization"] = f"token {self.token}"
         if self.cookie:
@@ -148,6 +191,60 @@ class Settings:
             return self.origin
         parsed = urlsplit(self.base_url)
         return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+
+    @property
+    def proxy_kind(self) -> str:
+        mode = normalize_proxy_mode(self.proxy_mode)
+        if mode in {"auto", "none"}:
+            return mode
+        return "socks" if urlsplit(mode).scheme.startswith("socks") else "http"
+
+    @property
+    def proxy_label(self) -> str:
+        kind = self.proxy_kind
+        return f"explicit_{kind}" if kind in {"http", "socks"} else kind
+
+    @property
+    def httpx_proxy_kwargs(self) -> dict[str, object]:
+        mode = normalize_proxy_mode(self.proxy_mode)
+        if mode == "auto":
+            return {"trust_env": True}
+        if mode == "none":
+            return {"trust_env": False}
+        return {"proxy": mode, "trust_env": False}
+
+    @property
+    def websocket_proxy(self) -> bool | str | None:
+        mode = normalize_proxy_mode(self.proxy_mode)
+        if mode == "auto":
+            return True
+        if mode == "none":
+            return None
+        return mode
+
+    def effective_websocket_proxy_label(self) -> str:
+        """Describe proxy selection without returning an address or credentials."""
+        mode = normalize_proxy_mode(self.proxy_mode)
+        if mode != "auto":
+            return self.proxy_label
+        parsed = urlsplit(self.base_url)
+        host = parsed.hostname or ""
+        if host and proxy_bypass(host):
+            return "direct_from_environment"
+        proxies = {key.lower(): value for key, value in getproxies().items()}
+        websocket_scheme = "wss" if parsed.scheme == "https" else "ws"
+        keys = [websocket_scheme, "socks"]
+        keys.append("https" if websocket_scheme == "wss" else "http")
+        keys.append("all")
+        selected = next(
+            (proxies[key] for key in keys if proxies.get(key)),
+            None,
+        )
+        if not selected:
+            return "direct_from_environment"
+        proxy_scheme = urlsplit(selected).scheme.lower()
+        kind = "socks" if proxy_scheme.startswith("socks") else "http"
+        return f"{kind}_from_environment"
 
     def ssl_context(self) -> ssl.SSLContext | None:
         if not self.base_url.startswith("https://"):
@@ -193,6 +290,7 @@ class Settings:
                 else None
             ),
             "request_timeout": self.request_timeout,
+            "proxy_mode": self.proxy_label,
             "terminal": (
                 self.terminal
                 if reveal_sensitive
@@ -237,10 +335,10 @@ def load_config_file(path: Path) -> dict[str, Any]:
         raise ConfigurationError(f"cannot read Jupydex config {expanded}: {exc}") from exc
     if not isinstance(payload, dict):
         raise ConfigurationError(f"Jupydex config must contain a JSON object: {expanded}")
-    if (payload.get("token") or payload.get("cookie")) and stat.st_mode & 0o077:
+    if _config_contains_sensitive_data(payload) and stat.st_mode & 0o077:
         raise ConfigurationError(
-            f"Jupydex config contains credentials but is not private: {expanded}; "
-            f"run `chmod 600 {expanded}`"
+            "Jupydex config contains credentials or an explicit proxy URL but "
+            f"is not private: {expanded}; run `chmod 600 {expanded}`"
         )
     return payload
 
@@ -290,3 +388,14 @@ def _config_string(config: Mapping[str, Any], key: str) -> str | None:
     if not isinstance(value, str):
         raise ConfigurationError(f"Jupydex config field {key!r} must be a string")
     return value
+
+
+def _config_contains_sensitive_data(payload: Mapping[str, Any]) -> bool:
+    if payload.get("token") or payload.get("cookie"):
+        return True
+    proxy = payload.get("proxy_mode")
+    return isinstance(proxy, str) and proxy.strip().lower() not in {
+        "",
+        "auto",
+        "none",
+    }

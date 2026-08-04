@@ -48,6 +48,7 @@ $ jdx exec -- python -V
 | 交互终端 | 提供类似 SSH 的本地 TTY，按 `Ctrl-]` 安全脱离 |
 | 安全边界明确 | 不猜测终端、不批量删除、超时默认不杀远程进程 |
 | 默认脱敏 | 诊断结果隐藏地址、目录和凭据，执行结果默认不回显命令 |
+| 统一代理 | REST 与 WebSocket 共用 `auto`、`none`、HTTP 或 SOCKS 策略 |
 
 ## 工作原理
 
@@ -135,6 +136,26 @@ jdx shell
 
 按 **`Ctrl-]`** 脱离连接，但不会停止远程 shell 或它启动的子进程。
 
+### 6. 同时检查 REST 与 WebSocket
+
+```bash
+jdx doctor --websocket
+```
+
+结果会分别给出 `rest_connected` 和 `websocket_connected`。WebSocket
+握手检查需要已有的配置终端，也可以使用 `--terminal` 明确指定。
+
+默认代理模式为 `auto`，会读取 `HTTP_PROXY`、`HTTPS_PROXY`、
+`ALL_PROXY` 和 `NO_PROXY`。单次直连或显式代理必须把全局参数放在子命令前：
+
+```bash
+jdx --proxy none doctor --websocket
+jdx --proxy socks5://proxy.example:1080 list
+```
+
+需要 SOCKS 时请安装 `jupydex[socks]`。诊断信息只显示脱敏后的代理类型，
+不会打印代理地址或凭据。只有确认直连路径可信时才应使用 `none`。
+
 ## 命令速查
 
 | 命令 | 用途 |
@@ -196,6 +217,7 @@ jdx operation begin --directory /workspace/project/logs/jupydex_ops
 - 优先使用 HTTPS/WSS、可信 VPN 或 SSH 端口转发。
 - token 一旦出现在聊天、日志、截图、shell 历史或 Git 中，应立即轮换。
 - 保持 TLS 证书校验；私有证书使用 `--ca-bundle`。
+- 使用代理时让 REST 与 WebSocket 保持同一策略；显式代理配置同样按凭据保护。
 - 每个智能体或工作流使用独立终端名。
 - 超时默认不会终止远程命令；只有 `--interrupt-on-timeout` 才发送 `Ctrl-C`。
 - 断线且结果未确认时保留原终端，先核验状态，禁止盲目重复变更命令。

@@ -37,6 +37,22 @@ class WebSocketTransportError(GatewayError):
     """Raised when a Jupyter terminal WebSocket transport fails."""
 
 
+class ProxySupportError(GatewayError):
+    """Raised when the selected proxy requires an unavailable dependency."""
+
+    def __init__(self, proxy_mode: str) -> None:
+        self.proxy_mode = proxy_mode
+        self.remediation = [
+            "Add the Jupyter host to NO_PROXY when a direct connection is intended",
+            "or install jupydex[socks] when the SOCKS proxy is required",
+            "or run with --proxy none only when a direct route is trusted",
+        ]
+        super().__init__(
+            "SOCKS proxy support is unavailable; proxy address and credentials "
+            "were redacted"
+        )
+
+
 class RemoteOutcomeUnknownError(GatewayError):
     """Raised when transport loss prevents confirmation of remote completion."""
 
@@ -134,13 +150,28 @@ class JupyterTerminalClient:
         self.settings = settings
         self._owns_http_client = http_client is None
         ssl_context = settings.ssl_context()
-        self._http = http_client or httpx.AsyncClient(
-            base_url=f"{settings.base_url}/",
-            headers=settings.http_headers,
-            timeout=settings.request_timeout,
-            verify=ssl_context if ssl_context is not None else True,
-            follow_redirects=False,
-        )
+        try:
+            self._http = http_client or httpx.AsyncClient(
+                base_url=f"{settings.base_url}/",
+                headers=settings.http_headers,
+                timeout=settings.request_timeout,
+                verify=ssl_context if ssl_context is not None else True,
+                follow_redirects=False,
+                **settings.httpx_proxy_kwargs,
+            )
+        except ImportError as exc:
+            if _is_socks_dependency_error(exc):
+                raise ProxySupportError(
+                    settings.effective_websocket_proxy_label()
+                ) from exc
+            raise
+        except ValueError as exc:
+            if "proxy" in str(exc).lower():
+                raise GatewayError(
+                    "proxy configuration was rejected; address and credentials "
+                    "were redacted"
+                ) from exc
+            raise
         self._connector = connector or websockets.connect
         self._reconnect_delays = reconnect_delays
         self._sleep = sleeper
@@ -156,37 +187,103 @@ class JupyterTerminalClient:
             await self._http.aclose()
 
     async def status(
-        self, *, reveal_sensitive: bool = False
+        self,
+        *,
+        reveal_sensitive: bool = False,
+        check_websocket: bool = False,
+        terminal: str | None = None,
     ) -> dict[str, object]:
         status = await self._request("GET", "api/status")
         terminals = await self.list_terminals()
+        selected_terminal = terminal or self.settings.terminal
+        if selected_terminal:
+            validate_terminal_name(selected_terminal)
         configured = (
             next(
                 (
                     terminal
                     for terminal in terminals
-                    if terminal.get("name") == self.settings.terminal
+                    if terminal.get("name") == selected_terminal
                 ),
                 None,
             )
-            if self.settings.terminal
+            if selected_terminal
             else None
+        )
+        websocket = await self._websocket_diagnostic(
+            selected_terminal,
+            configured is not None,
+            check=check_websocket,
         )
         return {
             "connected": True,
+            "rest_connected": True,
+            "websocket_connected": websocket["connected"],
+            "websocket": websocket,
             "server": status,
             "terminal_count": len(terminals),
             "configured_terminal": (
                 configured
                 if reveal_sensitive
                 else {"configured": True, "online": configured is not None}
-                if self.settings.terminal
+                if selected_terminal
                 else {"configured": False, "online": None}
             ),
             "config": self.settings.public_summary(
                 reveal_sensitive=reveal_sensitive
             ),
         }
+
+    async def _websocket_diagnostic(
+        self,
+        terminal: str | None,
+        terminal_online: bool,
+        *,
+        check: bool,
+    ) -> dict[str, object]:
+        result: dict[str, object] = {
+            "checked": False,
+            "connected": None,
+            "proxy_mode": self.settings.effective_websocket_proxy_label(),
+        }
+        if not check:
+            result["reason"] = "run doctor --websocket to test the handshake"
+            return result
+        if not terminal:
+            result["reason"] = "no terminal was configured for the handshake"
+            return result
+        if not terminal_online:
+            result["reason"] = "the selected terminal does not exist"
+            return result
+
+        result["checked"] = True
+        try:
+            async with self._connect(terminal):
+                pass
+        except ProxySupportError as exc:
+            result.update(
+                {
+                    "connected": False,
+                    "error": type(exc).__name__,
+                    "message": str(exc),
+                    "remediation": exc.remediation,
+                }
+            )
+        except GatewayError as exc:
+            result.update(
+                {
+                    "connected": False,
+                    "error": type(exc).__name__,
+                    "message": str(exc),
+                    "remediation": [
+                        "Check the proxy mode and NO_PROXY rules",
+                        "Check the WebSocket reverse proxy and Origin policy",
+                    ],
+                }
+            )
+        else:
+            result["connected"] = True
+        return result
 
     async def list_terminals(self) -> list[dict[str, object]]:
         payload = await self._request("GET", "api/terminals")
@@ -695,6 +792,7 @@ class JupyterTerminalClient:
         kwargs: dict[str, object] = {
             "additional_headers": self.settings.http_headers,
             "origin": self.settings.websocket_origin,
+            "proxy": self.settings.websocket_proxy,
             "open_timeout": self.settings.request_timeout,
             "max_size": None,
             "ping_interval": 20,
@@ -712,10 +810,21 @@ class JupyterTerminalClient:
                 raise AuthenticationError(
                     f"Jupyter rejected WebSocket authentication ({status_code})"
                 ) from exc
-            raise GatewayError(f"Jupyter WebSocket rejected the connection: {exc}") from exc
+            raise GatewayError(
+                "Jupyter WebSocket rejected the connection; response details "
+                "were redacted"
+            ) from exc
+        except ImportError as exc:
+            if _is_socks_dependency_error(exc):
+                raise ProxySupportError(
+                    self.settings.effective_websocket_proxy_label()
+                ) from exc
+            raise GatewayError(
+                "Jupyter WebSocket dependency failed without exposing network details"
+            ) from exc
         except (WebSocketException, OSError) as exc:
             raise WebSocketTransportError(
-                f"Jupyter WebSocket failed: {exc}"
+                "Jupyter WebSocket transport failed; network details were redacted"
             ) from exc
 
     async def _request(
@@ -732,12 +841,13 @@ class JupyterTerminalClient:
                 request_kwargs["json"] = json_body
             response = await self._http.request(method, path, **request_kwargs)
         except httpx.HTTPError as exc:
-            raise GatewayError(f"Jupyter request failed: {exc}") from exc
+            raise GatewayError(
+                "Jupyter request failed; network details were redacted"
+            ) from exc
 
         if response.status_code in {301, 302, 303, 307, 308}:
-            location = response.headers.get("location", "")
             raise AuthenticationError(
-                f"Jupyter redirected the API request to {location or 'a login page'}"
+                "Jupyter redirected the API request to a login or UI page"
             )
         if response.status_code in {401, 403}:
             raise AuthenticationError(
@@ -748,19 +858,18 @@ class JupyterTerminalClient:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            excerpt = response.text[:300].replace("\n", " ")
             raise GatewayError(
-                f"Jupyter returned HTTP {response.status_code}: {excerpt}"
+                f"Jupyter returned HTTP {response.status_code}; response body "
+                "redacted"
             ) from exc
 
         if not expect_json or response.status_code == 204:
             return None
         content_type = response.headers.get("content-type", "")
         if "json" not in content_type.lower():
-            excerpt = response.text[:200].replace("\n", " ")
             raise AuthenticationError(
                 "Jupyter returned non-JSON content; the URL may point to a login "
-                f"or UI page: {excerpt}"
+                "or UI page; response body redacted"
             )
         return response.json()
 
@@ -802,6 +911,19 @@ def _operation_status_file(directory: str, operation_id: str) -> str:
     base = directory.rstrip("/") or "/"
     separator = "" if base == "/" else "/"
     return f"{base}{separator}{operation_id}.status"
+
+
+def _is_socks_dependency_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "socks" in message and (
+        "requires" in message
+        or "required" in message
+        or "install" in message
+        or "not installed" in message
+        or "no module named" in message
+        or "missing" in message
+        or "unavailable" in message
+    )
 
 
 def _terminal_size(file_descriptor: int) -> tuple[int, int]:
