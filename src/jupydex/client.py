@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import math
 import os
 import re
 import shlex
@@ -17,7 +19,7 @@ import httpx
 import websockets
 from websockets.exceptions import InvalidStatus, WebSocketException
 
-from .config import Settings
+from .config import Settings, _cookie_value
 from .output import clean_terminal_output
 
 
@@ -119,6 +121,7 @@ class CommandResult:
     exit_code: int | None
     timed_out: bool
     elapsed_seconds: float
+    output_truncated: bool = False
 
     def as_dict(self, *, include_command: bool = False) -> dict[str, object]:
         result: dict[str, object] = {
@@ -127,6 +130,9 @@ class CommandResult:
             "exit_code": self.exit_code,
             "timed_out": self.timed_out,
             "elapsed_seconds": round(self.elapsed_seconds, 3),
+            "output_truncated": self.output_truncated,
+            "remote_outcome": "unknown" if self.timed_out else "completed",
+            "terminal_retained": True,
         }
         if include_command:
             result["command"] = self.command
@@ -175,6 +181,7 @@ class JupyterTerminalClient:
         self._connector = connector or websockets.connect
         self._reconnect_delays = reconnect_delays
         self._sleep = sleeper
+        self._session_ready = False
 
     async def __aenter__(self) -> "JupyterTerminalClient":
         return self
@@ -459,7 +466,7 @@ class JupyterTerminalClient:
                         try:
                             payload = json.loads(message)
                         except json.JSONDecodeError:
-                            os.write(output_fd, message.encode("utf-8", errors="replace"))
+                            os.write(output_fd, b"\r\n[JUPYDEX_NON_JSON_FRAME] response body redacted\r\n")
                             continue
                         if (
                             isinstance(payload, list)
@@ -526,8 +533,10 @@ class JupyterTerminalClient:
         validate_terminal_name(name)
         if not command.strip():
             raise GatewayError("command must not be empty")
-        if timeout <= 0:
-            raise GatewayError("timeout must be positive")
+        if "\x00" in command:
+            raise GatewayError("command must not contain NUL bytes")
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise GatewayError("timeout must be finite and positive")
         if max_chars <= 0:
             raise GatewayError("max_chars must be positive")
 
@@ -544,15 +553,34 @@ class JupyterTerminalClient:
         start_pattern = re.compile(
             r"(?:^|\r?\n)" + re.escape(start_marker) + r"\r?\n"
         )
+        invocation = f"bash -lc {shlex.quote(child_command)}"
+        # Interactive PTYs can discard input beyond their physical line limit.
+        # Encode multiline/long scripts into a quoted, short-line here-document.
+        # A separate script FD preserves terminal stdin and avoids ARG_MAX.
+        if len(invocation.encode("utf-8")) > 1024 or any(
+            ord(char) < 32 or ord(char) == 127 for char in child_command
+        ):
+            encoded = base64.b64encode(child_command.encode("utf-8")).decode("ascii")
+            payload = "\n".join(
+                encoded[index:index + 76] for index in range(0, len(encoded), 76)
+            )
+            delimiter = f"__JUPYDEX_PAYLOAD_{nonce}__"
+            invocation = (
+                "command -v base64 >/dev/null && "
+                f"bash -l /dev/fd/3 3< <(base64 -d <<'{delimiter}'\n"
+                f"{payload}\n{delimiter}\n)"
+            )
         script = (
+            "{\n"
             f"printf '\\n{start_marker}\\n'; "
             "__jupydex_status=0; "
-            f"bash -lc {shlex.quote(child_command)} "
+            f"{invocation} "
             "|| __jupydex_status=$?; "
-            f"printf '\\n{done_marker}:%s\\n' \"$__jupydex_status\"\r"
+            f"printf '\\n{done_marker}:%s\\n' \"$__jupydex_status\"\n"
+            "}\r"
         )
         done_pattern = re.compile(
-            re.escape(done_marker) + r":(?P<status>\d{1,3})(?:\r?\n|$)"
+            r"(?:^|\r?\n)" + re.escape(done_marker) + r":(?P<status>\d{1,3})\r?\n"
         )
 
         started = asyncio.get_running_loop().time()
@@ -563,28 +591,38 @@ class JupyterTerminalClient:
         reconnect_attempts = 0
         deadline = started + timeout
         capture_limit = max(max_chars * 2, len(done_marker) + 64)
+        output_truncated = False
+        start_seen = False
 
         while exit_code is None and not timed_out:
             try:
-                async with self._connect(name) as websocket:
+                async with self._connect(name, deadline=deadline) as websocket:
                     if not dispatch_attempted:
                         # Let Jupyter send reconnect scrollback before the new
                         # command. Reconnected sockets must retain scrollback:
                         # it may contain the completion marker.
                         stale_chunks: list[str] = []
                         await self._receive_for(
-                            websocket, stale_chunks, duration=0.15
+                            websocket, stale_chunks,
+                            duration=min(0.15, max(0, deadline - asyncio.get_running_loop().time())),
                         )
+                        remaining = deadline - asyncio.get_running_loop().time()
+                        if remaining <= 0:
+                            raise GatewayError("command deadline expired before dispatch")
                         dispatch_attempted = True
-                        await websocket.send(json.dumps(["stdin", script]))
+                        await asyncio.wait_for(
+                            websocket.send(json.dumps(["stdin", script])),
+                            timeout=remaining,
+                        )
 
                     while exit_code is None:
                         remaining = deadline - asyncio.get_running_loop().time()
                         if remaining <= 0:
                             timed_out = True
                             if interrupt_on_timeout:
-                                await websocket.send(
-                                    json.dumps(["stdin", "\x03"])
+                                await asyncio.wait_for(
+                                    websocket.send(json.dumps(["stdin", "\x03"])),
+                                    timeout=min(1.0, self.settings.request_timeout),
                                 )
                             break
                         try:
@@ -596,17 +634,29 @@ class JupyterTerminalClient:
                         text = _stdout_from_message(message)
                         if text is None:
                             continue
-                        captured_output = (
-                            captured_output + text
-                        )[-capture_limit:]
+                        captured_output += text
+                        if not start_seen:
+                            start_match = start_pattern.search(captured_output)
+                            if start_match:
+                                captured_output = captured_output[start_match.end():]
+                                start_seen = True
+                        if len(captured_output) > capture_limit:
+                            output_truncated |= start_seen
+                            captured_output = captured_output[-capture_limit:]
                         match = done_pattern.search(captured_output)
                         if match:
                             exit_code = int(match.group("status"))
-            except WebSocketTransportError as exc:
+            except (GatewayError, asyncio.TimeoutError) as exc:
                 # A close-handshake failure after a marker or an already
                 # established local timeout must not overwrite that result.
                 if exit_code is not None or timed_out:
                     break
+                if not isinstance(exc, WebSocketTransportError):
+                    if dispatch_attempted:
+                        raise RemoteOutcomeUnknownError(
+                            name, reconnect_attempts=reconnect_attempts,
+                        ) from exc
+                    raise
                 if reconnect_attempts >= len(self._reconnect_delays):
                     if dispatch_attempted:
                         raise RemoteOutcomeUnknownError(
@@ -630,13 +680,15 @@ class JupyterTerminalClient:
                     ) from exc
                 await self._sleep(delay)
 
-        output = captured_output
+        # Never return the echoed command when no start marker was observed.
+        output = captured_output if start_seen else ""
         start_match = start_pattern.search(output)
         if start_match:
             output = output[start_match.end() :]
         done_match = done_pattern.search(output)
         if done_match:
             output = output[: done_match.start()]
+        output_truncated |= len(output) > max_chars
         output = output[-max_chars:]
         if not raw:
             output = clean_terminal_output(output)
@@ -648,6 +700,7 @@ class JupyterTerminalClient:
             exit_code=exit_code,
             timed_out=timed_out,
             elapsed_seconds=elapsed,
+            output_truncated=output_truncated,
         )
 
     async def begin_operation(
@@ -784,16 +837,49 @@ class JupyterTerminalClient:
                 chunks.append(text)
 
     @asynccontextmanager
-    async def _connect(self, name: str) -> AsyncIterator[Any]:
+    async def _connect(
+        self, name: str, *, deadline: float | None = None
+    ) -> AsyncIterator[Any]:
+        def remaining_timeout() -> float:
+            remaining = self.settings.request_timeout
+            if deadline is not None:
+                remaining = min(remaining, deadline - asyncio.get_running_loop().time())
+            if remaining <= 0:
+                raise WebSocketTransportError("command connection deadline expired")
+            return remaining
+
+        # Token authentication may still establish an identity via Set-Cookie.
+        # Use that SAME session for REST and the WebSocket upgrade.
+        if not self._session_ready:
+            try:
+                await asyncio.wait_for(
+                    self.list_terminals(), timeout=remaining_timeout()
+                )
+            except asyncio.TimeoutError as exc:
+                raise WebSocketTransportError("Jupyter session setup timed out") from exc
         url = (
             f"{self.settings.websocket_url_prefix}/terminals/websocket/"
             f"{quote(name, safe='')}"
         )
+        # Build against the HTTP equivalent of the WS URL, so CookieJar applies
+        # domain, path, expiry, and Secure restrictions correctly.
+        cookie_request = httpx.Request(
+            "GET", f"{self.settings.base_url}/terminals/websocket/{quote(name, safe='')}"
+        )
+        self._http.cookies.set_cookie_header(cookie_request)
+        headers = self.settings.http_headers
+        learned_cookie = cookie_request.headers.get("cookie")
+        if learned_cookie and not self.settings.cookie:
+            headers["Cookie"] = learned_cookie
+            xsrf = _cookie_value(learned_cookie, "_xsrf")
+            if xsrf:
+                headers["X-XSRFToken"] = xsrf
         kwargs: dict[str, object] = {
-            "additional_headers": self.settings.http_headers,
+            "additional_headers": headers,
             "origin": self.settings.websocket_origin,
             "proxy": self.settings.websocket_proxy,
-            "open_timeout": self.settings.request_timeout,
+            "open_timeout": remaining_timeout(),
+            "close_timeout": 1.0,
             "max_size": None,
             "ping_interval": 20,
         }
@@ -810,6 +896,12 @@ class JupyterTerminalClient:
                 raise AuthenticationError(
                     f"Jupyter rejected WebSocket authentication ({status_code})"
                 ) from exc
+            if status_code == 404:
+                raise TerminalNotFoundError(
+                    "terminal unavailable to this session; check the exact terminal "
+                    "name and session cookie with doctor --websocket; no terminal "
+                    "was created or replaced"
+                ) from exc
             raise GatewayError(
                 "Jupyter WebSocket rejected the connection; response details "
                 "were redacted"
@@ -822,7 +914,7 @@ class JupyterTerminalClient:
             raise GatewayError(
                 "Jupyter WebSocket dependency failed without exposing network details"
             ) from exc
-        except (WebSocketException, OSError) as exc:
+        except (WebSocketException, OSError, asyncio.TimeoutError) as exc:
             raise WebSocketTransportError(
                 "Jupyter WebSocket transport failed; network details were redacted"
             ) from exc
@@ -871,7 +963,12 @@ class JupyterTerminalClient:
                 "Jupyter returned non-JSON content; the URL may point to a login "
                 "or UI page; response body redacted"
             )
-        return response.json()
+        try:
+            result = response.json()
+        except ValueError as exc:
+            raise GatewayError("Jupyter returned invalid JSON; response body redacted") from exc
+        self._session_ready = True
+        return result
 
 
 def _stdout_from_message(message: str | bytes | None) -> str | None:
@@ -884,7 +981,7 @@ def _stdout_from_message(message: str | bytes | None) -> str | None:
     try:
         payload = json.loads(message)
     except json.JSONDecodeError:
-        return f"\n[JUPYDEX_NON_JSON_FRAME] {message!r}\n"
+        return "\n[JUPYDEX_NON_JSON_FRAME] response body redacted\n"
     if (
         isinstance(payload, list)
         and len(payload) >= 2

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import ssl
 from dataclasses import dataclass
@@ -57,10 +58,10 @@ def normalize_server_url(raw_url: str) -> tuple[str, str | None]:
     path = parsed.path.rstrip("/")
     # Accept a URL copied from JupyterLab. For JupyterHub this preserves
     # prefixes such as /user/alice and removes only the UI portion.
-    for marker in ("/lab/", "/lab", "/tree/", "/tree"):
-        index = path.find(marker)
-        if index >= 0:
-            path = path[:index]
+    parts = path.split("/")
+    for index, part in enumerate(parts):
+        if part in {"lab", "tree"}:
+            path = "/".join(parts[:index])
             break
 
     query = parse_qs(parsed.query)
@@ -126,13 +127,17 @@ class Settings:
                 "set JUPYDEX_URL or run `jdx configure`"
             )
         base_url, query_token = normalize_server_url(raw_url)
+        saved_url = _config_string(config, "url") or _config_string(config, "base_url")
+        same_server = not saved_url or normalize_server_url(saved_url)[0] == base_url
         token = (
             source.get("JUPYDEX_TOKEN")
             or source.get("JUPYTER_TOKEN")
-            or _config_string(config, "token")
             or query_token
+            or (_config_string(config, "token") if same_server else None)
         )
-        cookie = source.get("JUPYDEX_COOKIE") or _config_string(config, "cookie")
+        cookie = source.get("JUPYDEX_COOKIE") or (
+            _config_string(config, "cookie") if same_server else None
+        )
         ca_value = source.get("JUPYDEX_CA_BUNDLE") or _config_string(
             config, "ca_bundle"
         )
@@ -144,8 +149,8 @@ class Settings:
             )
         except (TypeError, ValueError) as exc:
             raise ConfigurationError("JUPYDEX_TIMEOUT must be a number") from exc
-        if request_timeout <= 0:
-            raise ConfigurationError("JUPYDEX_TIMEOUT must be positive")
+        if not math.isfinite(request_timeout) or request_timeout <= 0:
+            raise ConfigurationError("JUPYDEX_TIMEOUT must be finite and positive")
         proxy_value = source.get("JUPYDEX_PROXY")
         if proxy_value is None:
             proxy_value = _config_string(config, "proxy_mode")
@@ -169,7 +174,7 @@ class Settings:
 
     @property
     def http_headers(self) -> dict[str, str]:
-        headers = {"Accept": "application/json", "User-Agent": "jupydex/0.4"}
+        headers = {"Accept": "application/json", "User-Agent": "jupydex/0.5"}
         if self.token:
             headers["Authorization"] = f"token {self.token}"
         if self.cookie:

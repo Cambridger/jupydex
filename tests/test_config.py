@@ -18,6 +18,35 @@ from jupydex.config import (
 
 
 class NormalizeUrlTests(unittest.TestCase):
+    def test_ui_names_only_match_whole_path_segments(self) -> None:
+        for path in ("/user/laboratory", "/treehouse", "/collaboration"):
+            self.assertEqual(
+                normalize_server_url(f"https://example.test{path}/lab")[0],
+                f"https://example.test{path}",
+            )
+
+    def test_url_token_rotation_overrides_saved_token_not_explicit_env(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private.json"
+            save_config_file(path, {"url": "https://example.test", "token": "old"})
+            env = {"JUPYDEX_CONFIG": str(path), "JUPYDEX_URL": "https://example.test/lab?token=new"}
+            self.assertEqual(Settings.from_env(env).token, "new")
+            env["JUPYDEX_TOKEN"] = "explicit"
+            self.assertEqual(Settings.from_env(env).token, "explicit")
+
+    def test_saved_credentials_do_not_follow_another_server(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private.json"
+            save_config_file(path, {"url": "https://old.example", "token": "old", "cookie": "session=old"})
+            settings = Settings.from_env({"JUPYDEX_CONFIG": str(path), "JUPYDEX_URL": "https://new.example"})
+            self.assertIsNone(settings.token)
+            self.assertIsNone(settings.cookie)
+
+    def test_nonfinite_timeout_is_rejected(self) -> None:
+        for value in ("nan", "inf", "-inf", "0"):
+            with self.subTest(value=value), self.assertRaises(ConfigurationError):
+                Settings.from_env({"JUPYDEX_URL": "https://example.test", "JUPYDEX_TIMEOUT": value})
+
     def test_proxy_modes_are_normalized_and_validated(self) -> None:
         self.assertEqual(normalize_proxy_mode(None), "auto")
         self.assertEqual(normalize_proxy_mode(" NONE "), "none")

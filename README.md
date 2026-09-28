@@ -239,6 +239,11 @@ Jupydex supports:
 
 Environment variables take precedence over the saved profile:
 
+Use `jdx --config PATH ...` to select a profile for one call. Same-server token
+rotation preserves connection defaults. A fresh URL token overrides a saved
+token (but not an explicit token environment variable). For literal scripts,
+use `jdx exec --file script.sh` or `--file -` instead of nested local quoting.
+
 | Variable | Meaning |
 |---|---|
 | `JUPYDEX_URL` | Jupyter Server base or copied Lab URL |
@@ -300,6 +305,7 @@ and [JupyterLab terminals](https://jupyterlab.readthedocs.io/en/stable/user/term
 | [Installation](docs/installation.md) | Install methods, server prerequisites, auth, SSH tunnel, upgrades |
 | [Usage](docs/usage.md) | Complete command guide, examples, troubleshooting |
 | [Agent integration](docs/agent-integration.md) | JSON contract, `jq`, Python API, operational guardrails |
+| [0.5 reliability review](docs/reliability-0.5.md) | Field issues, fixes, tests, and recovery boundaries |
 | [Security policy](SECURITY.md) | Threat model, credential response, reporting |
 | [中文说明](README.zh-CN.md) | 中文安装、配置与快速使用 |
 

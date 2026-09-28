@@ -37,6 +37,21 @@ $ jdx exec -- python -V
 > Jupydex 不是 SSH 服务，不会自行提供加密或权限隔离。请把它与 Jupyter
 > 身份验证以及 HTTPS/WSS、可信 VPN 或 SSH 隧道配合使用。
 
+## 0.5.0 可靠性升级
+
+- REST 与 WebSocket 复用服务器签发的身份 cookie，减少“API 正常但终端 404”的问题。
+- 长命令、多行脚本用短行编码传输，避免 PTY 截断；新增 `jdx exec --file script.sh`
+  和 `--file -`，减少本地 shell 提前展开变量的问题。编码不是加密。
+- token 更新不再重置同一服务器的 terminal、cwd、代理和 TLS 设置；支持
+  `jdx --config PATH doctor --websocket` 明确选择配置。
+- 完整接收退出码后才确认完成；超时或发送后的重连认证失败仍视为“远端结果未知”，
+  不重发命令、不删除终端。输出截断会明确标记。
+- cookie 默认仅保存在当前客户端内存；若服务器按匿名会话隔离终端，跨 CLI
+  调用仍需配置稳定的 session cookie。不会擅自重建或接管终端。
+
+完整问题归类、修复和限制见 [可靠性复盘](docs/reliability-0.5.md)。OOM、外部
+SIGTERM、磁盘容量及训练调度属于远端任务问题，不会被客户端升级自动修复。
+
 ## 核心能力
 
 | 能力 | 说明 |

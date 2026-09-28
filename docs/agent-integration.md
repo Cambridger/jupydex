@@ -112,6 +112,9 @@ Typical `exec` result:
 | `exit_code` | integer or null | Remote shell status, null on timeout/disconnect |
 | `timed_out` | boolean | Local wait deadline expired |
 | `elapsed_seconds` | number | Client-side elapsed time |
+| `output_truncated` | boolean | Output exceeded the capture limit |
+| `remote_outcome` | string | `completed` or `unknown` (timeout) |
+| `terminal_retained` | boolean | Always true for `exec`; no implicit deletion |
 | `command` | string, opt-in | Present only with `--show-command` |
 
 Do not store the complete payload unless remote output is safe to retain.
@@ -204,6 +207,17 @@ Prefer a documented remote launcher that writes:
 - one durable log file;
 - machine-readable status or completion markers;
 - output artifacts in unique, non-overwriting directories.
+
+Use an independently managed persistent service/supervisor for long jobs;
+terminal attachment, a successful launch command, `nohup`, or a placeholder
+allocation is not proof of useful work. Verify the real compute PID and
+durable service state. Jupydex only transports commands; it does not supervise
+GPU handoffs or recover training state.
+
+Use `exec --file` for scripts with nested quotes or variables. Keep one caller
+per dedicated terminal and never inject another command after an unconfirmed
+timeout. See [Reliability notes](reliability-0.5.md) for session-cookie and
+terminal-ownership limits.
 
 Then use short read-only calls:
 

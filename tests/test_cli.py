@@ -9,12 +9,13 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
-from jupydex.cli import _configure, build_parser, main
-from jupydex.client import ProxySupportError, RemoteOutcomeUnknownError
+from jupydex.cli import _configure, _run, build_parser, main
+from jupydex.client import CommandResult, ProxySupportError, RemoteOutcomeUnknownError
 from jupydex.config import (
     ConfigurationError,
     Settings,
     load_config_file,
+    save_config_file,
 )
 
 
@@ -36,6 +37,37 @@ def _args(**overrides: object) -> argparse.Namespace:
 
 
 class ConfigureTests(unittest.TestCase):
+    def test_token_rotation_preserves_connection_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private.json"
+            old = {
+                "url": "https://example.test", "token": "old",
+                "terminal": "dedicated", "cwd": "/workspace/project",
+                "proxy_mode": "none", "verify_tls": False, "request_timeout": 45,
+                "origin": "https://origin.example",
+            }
+            save_config_file(path, old)
+            args = build_parser().parse_args(["--config", str(path), "configure", "--url", old["url"]])
+            with mock.patch("jupydex.cli.getpass.getpass", return_value="new"):
+                _configure(args)
+            self.assertEqual(load_config_file(path), dict(old, token="new"))
+
+    def test_server_change_does_not_copy_private_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private.json"
+            save_config_file(path, {"url": "https://old.example", "token": "old", "terminal": "old", "cwd": "/private", "verify_tls": False})
+            args = build_parser().parse_args(["configure", "--config", str(path), "--url", "https://new.example", "--auth", "none"])
+            _configure(args)
+            self.assertEqual(load_config_file(path), {"url": "https://new.example", "verify_tls": True, "proxy_mode": "auto"})
+
+    def test_global_config_selects_file_for_read_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private.json"
+            save_config_file(path, {"url": "https://example.test"})
+            with mock.patch.dict("os.environ", {}, clear=True), mock.patch("jupydex.cli._run", new_callable=mock.AsyncMock, return_value=[]) as run:
+                self.assertEqual(main(["--config", str(path), "list"]), 0)
+            self.assertEqual(run.call_args.args[1].base_url, "https://example.test")
+
     def test_proxy_override_is_applied_to_one_call(self) -> None:
         captured: dict[str, str] = {}
 
@@ -196,6 +228,28 @@ class ConfigureTests(unittest.TestCase):
             self.assertEqual(result["config"]["proxy_mode"], "explicit_socks")
             self.assertNotIn("proxy.example", repr(result))
             self.assertNotIn("secret", repr(result))
+
+
+class ScriptInputTests(unittest.IsolatedAsyncioTestCase):
+    async def test_file_and_stdin_preserve_shell_literals(self) -> None:
+        script = "value='$HOME $(false)'\nprintf '%s\\n' \"$value\"\n"
+        settings = Settings(base_url="https://example.test", terminal="agent")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "script.sh"
+            path.write_text(script, encoding="utf-8")
+            for source in (str(path), "-"):
+                with self.subTest(source=source), mock.patch("jupydex.cli.JupyterTerminalClient") as constructor, mock.patch("jupydex.cli.sys.stdin", io.StringIO(script)):
+                    client = constructor.return_value.__aenter__.return_value
+                    client.execute.return_value = CommandResult("agent", script, "", 0, False, 0)
+                    await _run(build_parser().parse_args(["exec", "--file", source]), settings)
+                    self.assertEqual(client.execute.call_args.args[1], script)
+
+    async def test_file_input_cannot_be_combined_with_other_commands(self) -> None:
+        with mock.patch("jupydex.cli.JupyterTerminalClient"):
+            for options in (["--shell", "true"], ["--", "true"]):
+                args = build_parser().parse_args(["exec", "--file", "-", *options])
+                with self.assertRaises(ConfigurationError):
+                    await _run(args, Settings(base_url="https://example.test"))
 
 
 if __name__ == "__main__":

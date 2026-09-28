@@ -9,6 +9,7 @@ Jupydex is called by automation.
 jdx --version
 jdx --pretty doctor
 jdx --proxy none doctor --websocket
+jdx --config /private/path/profile.json doctor --websocket
 jdx <command> --help
 ```
 
@@ -18,6 +19,10 @@ jdx <command> --help
 `--proxy` is a global, one-call override and must appear before the subcommand.
 It accepts `auto`, `none`, or an explicit HTTP/SOCKS5 proxy URL. See
 [Proxy behavior](#proxy-behavior).
+
+`--config PATH` selects a private profile for any command and must precede the
+subcommand. `configure --config PATH` remains supported. Both override
+`JUPYDEX_CONFIG`; environment-variable connection overrides still apply.
 
 ## Diagnose the connection
 
@@ -150,6 +155,21 @@ jdx exec --shell 'printf "%s\n" "$PATH" > environment.txt'
 `--shell` is intentionally arbitrary shell execution. Never interpolate
 untrusted text into the shell string.
 
+For scripts or nested quoting, avoid expansion by the local shell:
+
+```bash
+jdx exec --file ./health-check.sh
+jdx exec --file - <<'REMOTE_SCRIPT'
+printf '%s\n' "$PATH"
+REMOTE_SCRIPT
+```
+
+`--file`, `--shell`, and arguments after `--` are mutually exclusive. Files
+must be UTF-8; `-` reads local stdin. The script is executed, not installed on
+the server. Long, multiline, and control-character commands are encoded into
+short physical terminal lines to avoid PTY truncation. This requires remote
+Bash, `base64 -d`, and `/dev/fd`, and does not encrypt or hide terminal history.
+
 ### Working directory
 
 The precedence is:
@@ -163,7 +183,8 @@ The precedence is:
 jdx exec --cwd /workspace/other-project -- pwd
 ```
 
-Every `exec` command runs inside an independent `bash -lc` child shell. Shell
+Every `exec` command runs inside an independent login Bash child shell
+(`bash -lc` for short commands, a separate script FD for encoded scripts). Shell
 options such as `set -e`, `exit`, exports, and directory changes affect that
 command only; they cannot terminate or mutate the outer terminal shell that
 prints Jupydex's completion marker. Use `shell` or deliberate `send` calls when
@@ -175,12 +196,15 @@ you specifically need interactive shell state to persist.
 jdx exec --timeout 10 -- long-command
 ```
 
-A timeout stops waiting locally but leaves the remote command running:
+A timeout stops waiting locally but does not stop the remote command; its
+outcome remains unknown:
 
 ```json
 {
   "exit_code": null,
-  "timed_out": true
+  "timed_out": true,
+  "remote_outcome": "unknown",
+  "terminal_retained": true
 }
 ```
 
@@ -192,6 +216,10 @@ jdx exec --timeout 10 --interrupt-on-timeout -- long-command
 
 Sending `Ctrl-C` is not a guarantee that the program stops. Confirm the exact
 remote process state before taking another action.
+
+Connection bootstrap, handshake, and command dispatch use the same command
+deadline. Socket cleanup may take up to one additional second. A transport or
+authentication failure after dispatch never authorizes resending the command.
 
 ### Output limits and ANSI control codes
 
@@ -206,6 +234,10 @@ By default, Jupydex:
 - strips common ANSI control sequences;
 - applies carriage-return and backspace behavior;
 - removes its private completion markers.
+
+`output_truncated: true` indicates discarded output. Before a start marker is
+observed, echoed input is withheld, including on timeout. Non-JSON transport
+frames are annotated without reflecting their raw bodies.
 
 Use `--raw` when exact terminal control bytes are required.
 

@@ -86,12 +86,11 @@ class _ExecutingWebSocket(_FakeWebSocket):
         process = await asyncio.create_subprocess_exec(
             "/bin/bash",
             "-e",
-            "-c",
-            decoded[1].rstrip("\r"),
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
-        output, _ = await process.communicate()
+        output, _ = await process.communicate(decoded[1].rstrip("\r").encode("utf-8"))
         if self.close_after_execution:
             await self.responses.put("")
         else:
@@ -491,6 +490,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         result = await client.execute("codex", "true", timeout=2, raw=True)
         self.assertEqual(result.exit_code, 0)
         self.assertIn("[JUPYDEX_NON_JSON_FRAME]", result.output)
+        self.assertNotIn("not-json", result.output)
         self.assertIn("finished", result.output)
         await http.aclose()
 
@@ -538,7 +538,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         def handler(request: httpx.Request) -> httpx.Response:
             requests.append((request.method, request.url.path))
             return httpx.Response(
-                204,
+                200, json=[],
                 headers={"content-type": "application/json"},
             )
 
@@ -650,6 +650,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             request = connection.request
             seen["path"] = request.path
             seen["authorization"] = request.headers["Authorization"]
+            seen["cookie"] = request.headers["Cookie"]
             message = await connection.recv()
             script = json.loads(message)[1]
             start = script.split("printf '\\n", 1)[1].split("\\n'", 1)[0]
@@ -663,7 +664,10 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         http = httpx.AsyncClient(
             transport=httpx.MockTransport(
                 lambda _: httpx.Response(
-                    200, json=[], headers={"content-type": "application/json"}
+                    200, json=[], headers={
+                        "content-type": "application/json",
+                        "set-cookie": "identity=loopback; Path=/",
+                    }
                 )
             ),
             base_url=f"http://127.0.0.1:{port}/",
@@ -696,6 +700,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(seen["path"], "/terminals/websocket/codex_terminal")
         self.assertEqual(seen["authorization"], "token test-token")
+        self.assertEqual(seen["cookie"], "identity=loopback")
 
     @staticmethod
     def _http_client() -> httpx.AsyncClient:

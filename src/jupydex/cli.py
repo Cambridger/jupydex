@@ -22,6 +22,7 @@ from .config import (
     ConfigurationError,
     Settings,
     default_config_path,
+    load_config_file,
     normalize_proxy_mode,
     normalize_server_url,
     save_config_file,
@@ -43,6 +44,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="Control a dedicated JupyterLab terminal without browser automation.",
     )
     parser.add_argument("--version", action="version", version=__version__)
+    parser.add_argument(
+        "--config", dest="config_override", metavar="PATH",
+        help="select a private config for any command (before the subcommand)",
+    )
     parser.add_argument(
         "--pretty",
         action="store_true",
@@ -81,15 +86,21 @@ def build_parser() -> argparse.ArgumentParser:
     configure.add_argument(
         "--proxy",
         dest="saved_proxy",
-        default="auto",
+        default=None,
         metavar="auto|none|URL",
-        help="proxy policy to save; defaults to auto",
+        help="proxy policy to save; preserve existing policy on the same server",
     )
     configure.add_argument("--ca-bundle", help="private CA certificate bundle")
-    configure.add_argument(
+    tls = configure.add_mutually_exclusive_group()
+    tls.add_argument(
         "--no-verify-tls",
         action="store_true",
+        default=None,
         help="disable TLS verification (not recommended)",
+    )
+    tls.add_argument(
+        "--verify-tls", dest="no_verify_tls", action="store_false",
+        help="enable TLS verification",
     )
     configure.add_argument(
         "--config",
@@ -142,6 +153,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--shell",
         dest="shell_command",
         help="run this exact shell string (useful for pipes and redirections)",
+    )
+    execute.add_argument(
+        "--file", dest="script_file", metavar="PATH",
+        help="read a UTF-8 shell script without local expansion; '-' reads stdin",
     )
     execute.add_argument(
         "--interrupt-on-timeout",
@@ -261,15 +276,33 @@ async def _run(args: argparse.Namespace, settings: Settings) -> dict[str, Any] |
             command_parts = list(args.command)
             if command_parts and command_parts[0] == "--":
                 command_parts.pop(0)
-            if args.shell_command is not None and command_parts:
+            sources = (
+                args.shell_command is not None,
+                args.script_file is not None,
+                bool(command_parts),
+            )
+            if sum(sources) > 1:
                 raise ConfigurationError(
-                    "use either --shell or command arguments after --, not both"
+                    "use only one of --shell, --file, or command arguments after --"
                 )
             command = (
                 args.shell_command
                 if args.shell_command is not None
                 else shlex.join(command_parts)
             )
+            if args.script_file is not None:
+                try:
+                    command = (
+                        sys.stdin.read()
+                        if args.script_file == "-"
+                        else Path(args.script_file).expanduser().read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                except (OSError, UnicodeError) as exc:
+                    raise ConfigurationError(
+                        "cannot read UTF-8 command file; file details redacted"
+                    ) from exc
             result = await client.execute(
                 _terminal(args, settings),
                 command,
@@ -348,7 +381,6 @@ def _configure(args: argparse.Namespace) -> dict[str, Any]:
         if not raw_url:
             raise ConfigurationError("no JupyterLab URL was provided")
     base_url, url_token = normalize_server_url(raw_url)
-    proxy_mode = normalize_proxy_mode(args.saved_proxy)
     if args.url is not None and url_token:
         raise ConfigurationError(
             "refusing a token in --url because command-line arguments may be "
@@ -370,16 +402,30 @@ def _configure(args: argparse.Namespace) -> dict[str, Any]:
         if not credential:
             raise ConfigurationError("no Jupyter cookie was provided")
 
-    path = (
-        os.path.expanduser(args.config)
-        if args.config
-        else str(default_config_path())
+    selected_path = (
+        args.config
+        or getattr(args, "config_override", None)
+        or os.environ.get("JUPYDEX_CONFIG")
     )
-    payload: dict[str, Any] = {
-        "url": base_url,
-        "verify_tls": not args.no_verify_tls,
-        "proxy_mode": proxy_mode,
-    }
+    path = os.path.expanduser(selected_path) if selected_path else str(default_config_path())
+    absolute_path = Path(os.path.abspath(path))
+    previous = load_config_file(absolute_path)
+    previous_url = previous.get("url") or previous.get("base_url")
+    # A token rotation must not reset terminal/cwd/TLS/proxy settings. A change
+    # of server must not carry credentials or private defaults to a new host.
+    payload: dict[str, Any] = {}
+    if previous_url and normalize_server_url(previous_url)[0] == base_url:
+        payload.update(previous)
+    payload.pop("token", None)
+    payload.pop("cookie", None)
+    payload.pop("base_url", None)
+    payload["url"] = base_url
+    if args.no_verify_tls is not None:
+        payload["verify_tls"] = not args.no_verify_tls
+    else:
+        payload.setdefault("verify_tls", True)
+    proxy_mode = normalize_proxy_mode(args.saved_proxy or payload.get("proxy_mode"))
+    payload["proxy_mode"] = proxy_mode
     if args.auth == "token":
         payload["token"] = credential
     elif args.auth == "cookie":
@@ -388,16 +434,20 @@ def _configure(args: argparse.Namespace) -> dict[str, Any]:
         value = getattr(args, key)
         if value:
             payload[key] = value
-    absolute_path = Path(os.path.abspath(path))
     save_config_file(absolute_path, payload)
     settings = Settings(
         base_url=base_url,
         token=credential if args.auth == "token" else None,
         cookie=credential if args.auth == "cookie" else None,
-        verify_tls=not args.no_verify_tls,
-        ca_bundle=Path(args.ca_bundle).expanduser() if args.ca_bundle else None,
-        terminal=args.terminal,
-        cwd=args.cwd,
+        verify_tls=payload["verify_tls"],
+        ca_bundle=(
+            Path(payload["ca_bundle"]).expanduser()
+            if payload.get("ca_bundle") else None
+        ),
+        request_timeout=float(payload.get("request_timeout", 20.0)),
+        terminal=payload.get("terminal"),
+        cwd=payload.get("cwd"),
+        origin=payload.get("origin"),
         proxy_mode=proxy_mode,
     )
     return {
@@ -428,7 +478,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.action == "configure":
             result = _configure(args)
         else:
-            settings = Settings.from_env()
+            if args.config_override is not None:
+                selected_env = dict(os.environ, JUPYDEX_CONFIG=args.config_override)
+                settings = Settings.from_env(selected_env)
+            else:
+                settings = Settings.from_env()
             if args.proxy_override is not None:
                 settings = replace(
                     settings,

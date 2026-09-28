@@ -2,6 +2,31 @@
 
 All notable changes to Jupydex are documented here.
 
+## 0.5.0 - 2026-09-28
+
+- Bootstrap REST identity before a terminal WebSocket handshake and forward
+  server-issued cookies with domain/path/Secure scoping. Preserve explicit
+  cookie overrides and diagnose inaccessible terminals without replacing them.
+- Add `exec --file PATH` and `exec --file -` to avoid local shell expansion.
+  Encode long, multiline, or control-character commands into short physical
+  PTY lines and execute through a separate Bash script descriptor, avoiding
+  both terminal line truncation and command argument-size limits.
+- Require the complete newline-terminated exit marker, including when status
+  digits arrive in separate WebSocket frames. Report output truncation and
+  unknown timeout outcomes explicitly; do not return unconfirmed command echo.
+- Bound handshake and dispatch waits by the command deadline. Authentication
+  and other reconnect failures after dispatch now preserve unknown-outcome
+  semantics, with no automatic command resubmission or terminal deletion.
+- Redact malformed REST JSON and non-JSON WebSocket response bodies.
+- Add global `--config PATH`. Token rotation preserves same-server connection
+  defaults; a fresh URL token takes precedence over a saved token, and saved
+  credentials are not inherited by a different server URL.
+- Normalize only whole `/lab` and `/tree` path segments and reject non-finite
+  timeout settings.
+- Add synthetic identity, framing, recovery, configuration, and real interactive
+  PTY regression coverage. Publish a sanitized field-issue review and explicit
+  limits of transport recovery in [Reliability notes](docs/reliability-0.5.md).
+
 ## 0.4.0 - 2026-08-04
 
 - Added a unified `auto`, `none`, or explicit proxy policy for HTTP REST and

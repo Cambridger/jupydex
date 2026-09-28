@@ -186,6 +186,20 @@ export JUPYDEX_CONFIG=/private/path/profile.json
 jdx doctor
 ```
 
+Or select it for one call with `jdx --config /private/path/profile.json doctor`.
+`configure` also respects this selection and `JUPYDEX_CONFIG`.
+
+When rotating a token for the same normalized server URL, `jdx configure`
+preserves unspecified terminal, working directory, Origin, proxy, timeout,
+and TLS settings. Use `--verify-tls` to explicitly re-enable certificate
+verification. Configuring a different server starts a fresh profile instead
+of carrying private defaults to it.
+
+Token precedence is explicit `JUPYDEX_TOKEN` / `JUPYTER_TOKEN`, then the token
+in the selected URL, then a same-server saved token. A URL override pointing
+to a different server does not inherit the saved token or cookie. Avoid
+token-bearing command-line arguments; use the hidden configure prompt.
+
 Disable saved-config loading and use only environment variables:
 
 ```bash
