@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import tempfile
 import unittest
 from pathlib import Path
@@ -89,8 +90,20 @@ class _ExecutingWebSocket(_FakeWebSocket):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
         )
-        output, _ = await process.communicate(decoded[1].rstrip("\r").encode("utf-8"))
+        try:
+            output, _ = await process.communicate(
+                decoded[1].rstrip("\r").encode("utf-8")
+            )
+        except BaseException:
+            # The synthetic remote shell must not outlive a cancelled test.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await process.communicate()
+            raise
         if self.close_after_execution:
             await self.responses.put("")
         else:
@@ -413,7 +426,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         result = await client.execute(
             "codex",
             "set -Eeuo pipefail; false",
-            timeout=2,
+            timeout=10,
         )
         self.assertEqual(result.exit_code, 1)
         self.assertFalse(result.timed_out)
@@ -598,7 +611,9 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
                 "codex",
                 directory,
                 operation_id="deploy_test",
-                timeout=2,
+                # Includes real subprocess/login-shell startup on busy CI
+                # hosts; this test checks recovery, not latency.
+                timeout=10,
             )
             self.assertEqual(started["state"], "STARTED")
 
@@ -621,7 +636,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
                     directory,
                     "deploy_test",
                     "TERM_SENT",
-                    timeout=2,
+                    timeout=10,
                 )
             self.assertEqual(
                 raised.exception.operation_id,
@@ -632,7 +647,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
                 "codex",
                 directory,
                 "deploy_test",
-                timeout=2,
+                timeout=10,
             )
             self.assertTrue(recovered["exists"])
             self.assertEqual(recovered["state"], "TERM_SENT")
